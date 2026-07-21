@@ -219,7 +219,7 @@ function buildTicketModal() {
       selectInput('urgency', '긴급도', options([
         ['높음', 'high'], ['중간', 'normal'], ['낮음', 'low'],
       ])),
-      textInput('description', '문의 내용', { multiline: true, max: 5000, placeholder: '문의 상세 내용을 입력하세요' }),
+      textInput('description', '문의 내용', { multiline: true, max: 3000, placeholder: '문의 상세 내용을 입력하세요' }),
     ],
   };
 }
