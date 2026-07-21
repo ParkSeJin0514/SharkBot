@@ -498,7 +498,6 @@ function buildTicketModal() {
       ]), { optional: true, hint: '기술문의인 경우 선택하세요' }),
       textInput('requester_email', '요청자 이메일', {
         placeholder: '요청자 이메일 주소',
-        hint: 'Zendesk가 이 이메일로 요청자를 매칭합니다',
       }),
       textInput('company', '회사명', { placeholder: '고객사 회사명' }),
       textInput('aws_account', 'AWS 계정 ID (Account Number)', {
