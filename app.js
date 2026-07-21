@@ -227,6 +227,6 @@ function buildTicketModal() {
 // ── 실행 ────────────────────────────────────────────────────
 (async () => {
   await app.start();
-  console.log('⚡ Sharkton 봇이 실행되었습니다. (Socket Mode)');
+  console.log('⚡ SharkBot이 실행되었습니다. (Socket Mode)');
   console.log(`   Zendesk 연동: ${zendeskEnabled ? 'ON' : 'OFF (개발 모드)'}`);
 })();
