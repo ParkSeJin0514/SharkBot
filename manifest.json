@@ -1,19 +1,18 @@
 {
   "display_information": {
-    "name": "Sharkton",
-    "description": "스마일샤크 고객 문의 봇 - Slack에서 바로 Zendesk 티켓 발행",
+    "name": "SharktBot",
+    "description": "SmileShark 전용 Bot",
     "background_color": "#0a2540"
   },
   "features": {
     "bot_user": {
-      "display_name": "Sharkton",
+      "display_name": "SharkBot",
       "always_online": true
     },
     "slash_commands": [
       {
-        "command": "/sharkton",
+        "command": "/Zendesk",
         "description": "스마일샤크에 문의 티켓을 보냅니다",
-        "usage_hint": "문의 폼 열기",
         "should_escape": false
       }
     ]

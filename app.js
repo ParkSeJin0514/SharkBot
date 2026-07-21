@@ -15,13 +15,8 @@ const {
 // Zendesk 미설정 시 티켓 생성은 건너뛰고 콘솔에만 출력(개발 편의용)
 const zendeskEnabled = Boolean(ZENDESK_SUBDOMAIN && ZENDESK_EMAIL && ZENDESK_API_TOKEN);
 
-// 심각도 → Zendesk priority 매핑
-const PRIORITY_MAP = {
-  urgent: '긴급',
-  high: '높음',
-  normal: '보통',
-  low: '낮음',
-};
+// 긴급도 값(=Zendesk priority) → 한국어 표시
+const URGENCY_LABEL = { high: '높음', normal: '중간', low: '낮음' };
 
 const app = new App({
   token: SLACK_BOT_TOKEN,
@@ -48,22 +43,26 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
 
   const userId = body.user.id;
   const v = view.state.values;
-  const subject = v.subject.value.value;
-  const type = v.type.value.selected_option.value;
-  const priority = v.priority.value.selected_option.value;
-  const account = v.account?.value?.value || '';
-  const description = v.description.value.value;
+  const form = {
+    formType: v.form_type.value.selected_option.value,
+    techArea: v.tech_area?.value?.selected_option?.value || '',
+    name: v.name.value.value,
+    company: v.company.value.value,
+    awsAccount: v.aws_account?.value?.value || '',
+    supportPlan: v.support_plan?.value?.selected_option?.value || '',
+    urgency: v.urgency.value.selected_option.value, // high | normal | low
+    supportLevel: v.support_level.value.selected_option.value,
+    description: v.description.value.value,
+  };
 
   try {
-    const requester = await resolveRequester(client, userId);
-    const ticket = await createZendeskTicket({
-      subject,
-      type,
-      priority,
-      account,
-      description,
-      requester,
-    });
+    const slackEmail = (await resolveRequesterEmail(client, userId)) || undefined;
+    logger.info(
+      `📨 문의 접수 | Slack ID: ${userId} | 성명: ${form.name} | 회사: ${form.company} | ` +
+        `이메일: ${slackEmail ?? '(없음)'} | 양식: ${form.formType} | 지원수준: ${form.supportLevel}`
+    );
+
+    const ticket = await createZendeskTicket(form, { name: form.name, email: slackEmail });
 
     const idText = ticket
       ? `티켓 *#${ticket.id}* 이(가) 생성되었습니다.`
@@ -73,20 +72,16 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
       channel: userId,
       text: `✅ 문의가 접수되었습니다. ${idText}`,
       blocks: [
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `✅ *문의가 접수되었습니다.*\n${idText}`,
-          },
-        },
+        { type: 'section', text: { type: 'mrkdwn', text: `✅ *문의가 접수되었습니다.*\n${idText}` } },
         {
           type: 'section',
           fields: [
-            { type: 'mrkdwn', text: `*제목:*\n${subject}` },
-            { type: 'mrkdwn', text: `*유형:*\n${type}` },
-            { type: 'mrkdwn', text: `*심각도:*\n${PRIORITY_MAP[priority] ?? priority}` },
-            { type: 'mrkdwn', text: `*대상:*\n${account || '-'}` },
+            { type: 'mrkdwn', text: `*양식:*\n${form.formType}${form.techArea ? ` (${form.techArea})` : ''}` },
+            { type: 'mrkdwn', text: `*지원수준:*\n${form.supportLevel}` },
+            { type: 'mrkdwn', text: `*회사/성명:*\n${form.company} / ${form.name}` },
+            { type: 'mrkdwn', text: `*긴급도:*\n${URGENCY_LABEL[form.urgency] ?? form.urgency}` },
+            { type: 'mrkdwn', text: `*AWS 계정 ID:*\n${form.awsAccount || '-'}` },
+            { type: 'mrkdwn', text: `*서포트 플랜:*\n${form.supportPlan || '-'}` },
           ],
         },
       ],
@@ -95,58 +90,65 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
     logger.error('티켓 생성 실패:', error);
     await client.chat.postMessage({
       channel: userId,
-      text: `⚠️ 문의 접수 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.`,
+      text: '⚠️ 문의 접수 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
     });
   }
 });
 
 // ── 헬퍼: 요청자(고객) 이메일 조회 ──────────────────────────
-async function resolveRequester(client, userId) {
+async function resolveRequesterEmail(client, userId) {
   try {
     const info = await client.users.info({ user: userId });
-    const profile = info.user?.profile ?? {};
-    return {
-      name: info.user?.real_name || profile.display_name || 'Slack User',
-      email: profile.email || undefined,
-    };
+    return info.user?.profile?.email || null;
   } catch {
-    return { name: 'Slack User', email: undefined };
+    return null;
   }
 }
 
 // ── 헬퍼: Zendesk 티켓 생성 ─────────────────────────────────
-async function createZendeskTicket({ subject, type, priority, account, description, requester }) {
+async function createZendeskTicket(form, requester) {
+  const subject = `[${form.company}] ${form.formType}${form.techArea ? `(${form.techArea})` : ''} - ${form.supportLevel}`;
+
+  const bodyText = [
+    form.description,
+    '',
+    '────────────',
+    `양식: ${form.formType}`,
+    `기술 분야: ${form.techArea || '-'}`,
+    `성명: ${form.name}`,
+    `회사명: ${form.company}`,
+    `AWS 계정 ID: ${form.awsAccount || '-'}`,
+    `AWS 서포트 플랜: ${form.supportPlan || '-'}`,
+    `긴급도: ${URGENCY_LABEL[form.urgency] ?? form.urgency}`,
+    `지원수준: ${form.supportLevel}`,
+    '(Sharkton 봇에서 자동 생성)',
+  ].join('\n');
+
   if (!zendeskEnabled) {
-    console.log('[DEV] Zendesk 미연동 — 티켓 생성 생략:', { subject, type, priority, account });
+    console.log('[DEV] Zendesk 미연동 — 티켓 생성 생략:', { subject });
     return null;
   }
 
-  const auth = Buffer.from(`${ZENDESK_EMAIL}/token:${ZENDESK_API_TOKEN}`).toString('base64');
-  const bodyText = [
-    description,
-    '',
-    '────────────',
-    `문의 유형: ${type}`,
-    `대상 계정/리소스: ${account || '-'}`,
-    '(Sharkton 봇에서 자동 생성)',
-  ].join('\n');
+  // TODO: Zendesk 커스텀 필드(양식·지원수준·계정ID 등)의 field ID를 확보하면
+  //       custom_fields: [{ id, value }] 로 정식 매핑 예정. 현재는 본문+태그로 처리.
+  const tags = ['sharkton', form.formType, form.techArea, form.supportLevel]
+    .filter(Boolean)
+    .map((t) => t.replace(/\s+/g, '_'));
 
   const payload = {
     ticket: {
       subject,
       comment: { body: bodyText },
-      priority, // urgent | high | normal | low
-      tags: ['sharkton', `type_${type}`],
+      priority: form.urgency, // high | normal | low
+      tags,
       ...(requester?.email ? { requester: { name: requester.name, email: requester.email } } : {}),
     },
   };
 
+  const auth = Buffer.from(`${ZENDESK_EMAIL}/token:${ZENDESK_API_TOKEN}`).toString('base64');
   const res = await fetch(`https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json`, {
     method: 'POST',
-    headers: {
-      Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/json',
-    },
+    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
 
@@ -154,12 +156,45 @@ async function createZendeskTicket({ subject, type, priority, account, descripti
     const text = await res.text();
     throw new Error(`Zendesk API ${res.status}: ${text}`);
   }
-
   const data = await res.json();
   return data.ticket;
 }
 
-// ── 문의 모달 정의 ──────────────────────────────────────────
+// ── 헬퍼: static_select 옵션 생성 ───────────────────────────
+function options(pairs) {
+  return pairs.map(([text, value]) => ({
+    text: { type: 'plain_text', text },
+    value: value ?? text,
+  }));
+}
+
+function selectInput(block_id, label, opts, { optional = false, placeholder = '선택', hint } = {}) {
+  const block = {
+    type: 'input',
+    block_id,
+    optional,
+    label: { type: 'plain_text', text: label },
+    element: {
+      type: 'static_select',
+      action_id: 'value',
+      placeholder: { type: 'plain_text', text: placeholder },
+      options: opts,
+    },
+  };
+  if (hint) block.hint = { type: 'plain_text', text: hint };
+  return block;
+}
+
+function textInput(block_id, label, { optional = false, multiline = false, placeholder, hint, max } = {}) {
+  const element = { type: 'plain_text_input', action_id: 'value', multiline };
+  if (placeholder) element.placeholder = { type: 'plain_text', text: placeholder };
+  if (max) element.max_length = max;
+  const block = { type: 'input', block_id, optional, label: { type: 'plain_text', text: label }, element };
+  if (hint) block.hint = { type: 'plain_text', text: hint };
+  return block;
+}
+
+// ── 문의 모달 정의 (스마일샤크 Zendesk 양식 기준) ───────────
 function buildTicketModal() {
   return {
     type: 'modal',
@@ -168,57 +203,30 @@ function buildTicketModal() {
     submit: { type: 'plain_text', text: '문의 접수' },
     close: { type: 'plain_text', text: '취소' },
     blocks: [
-      {
-        type: 'input',
-        block_id: 'subject',
-        label: { type: 'plain_text', text: '제목' },
-        element: { type: 'plain_text_input', action_id: 'value', max_length: 150 },
-      },
-      {
-        type: 'input',
-        block_id: 'type',
-        label: { type: 'plain_text', text: '문의 유형' },
-        element: {
-          type: 'static_select',
-          action_id: 'value',
-          placeholder: { type: 'plain_text', text: '선택' },
-          options: [
-            { text: { type: 'plain_text', text: '장애' }, value: '장애' },
-            { text: { type: 'plain_text', text: '요청' }, value: '요청' },
-            { text: { type: 'plain_text', text: '문의' }, value: '문의' },
-            { text: { type: 'plain_text', text: '기타' }, value: '기타' },
-          ],
-        },
-      },
-      {
-        type: 'input',
-        block_id: 'priority',
-        label: { type: 'plain_text', text: '심각도' },
-        element: {
-          type: 'static_select',
-          action_id: 'value',
-          placeholder: { type: 'plain_text', text: '선택' },
-          options: [
-            { text: { type: 'plain_text', text: '긴급' }, value: 'urgent' },
-            { text: { type: 'plain_text', text: '높음' }, value: 'high' },
-            { text: { type: 'plain_text', text: '보통' }, value: 'normal' },
-            { text: { type: 'plain_text', text: '낮음' }, value: 'low' },
-          ],
-        },
-      },
-      {
-        type: 'input',
-        block_id: 'account',
+      selectInput('form_type', '양식', options([
+        ['기술문의'], ['비용문의'], ['샤크몬 문의'], ['내부문서요청'], ['인시던트'], ['미팅협의'],
+      ])),
+      selectInput('tech_area', '기술 분야 (기술문의 시)', options([
+        ['AWS'], ['Datadog'], ['NHN'],
+      ]), { optional: true, hint: '기술문의인 경우 선택하세요' }),
+      textInput('name', '성명', { placeholder: '고객사 담당자 성명' }),
+      textInput('company', '회사명', { placeholder: '고객사 회사명' }),
+      textInput('aws_account', 'AWS 계정 ID (Account Number)', {
         optional: true,
-        label: { type: 'plain_text', text: '대상 계정/리소스' },
-        element: { type: 'plain_text_input', action_id: 'value', placeholder: { type: 'plain_text', text: '예: 계정 ID, 인스턴스 ID' } },
-      },
-      {
-        type: 'input',
-        block_id: 'description',
-        label: { type: 'plain_text', text: '상세 내용' },
-        element: { type: 'plain_text_input', action_id: 'value', multiline: true, max_length: 3000 },
-      },
+        multiline: true,
+        placeholder: '작업 필요한 계정 ID (여러 개면 줄바꿈으로 구분)',
+        hint: '중복/여러 개 입력 가능 — 한 줄에 하나씩',
+      }),
+      selectInput('support_plan', 'AWS 서포트 플랜', options([
+        ['Basic'], ['Developer'], ['Business'], ['Enterprise On-Ramp'], ['Enterprise'],
+      ]), { optional: true }),
+      selectInput('urgency', '긴급도', options([
+        ['높음', 'high'], ['중간', 'normal'], ['낮음', 'low'],
+      ])),
+      selectInput('support_level', '지원수준', options([
+        ['일반문의'], ['101'], ['201'], ['301'], ['내부문의'],
+      ])),
+      textInput('description', '문의 내용', { multiline: true, max: 3000, placeholder: '문의 상세 내용을 입력하세요' }),
     ],
   };
 }
