@@ -1,0 +1,14 @@
+{
+  "name": "sharkton-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "스마일샤크 고객 문의 봇 - Slack에서 Zendesk 티켓 발행",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4.2.0",
+    "dotenv": "^16.4.5"
+  }
+}
