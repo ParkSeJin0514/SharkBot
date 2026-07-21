@@ -2,3 +2,9 @@ node_modules/
 .env
 *.log
 .DS_Store
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
+# 배포 아티팩트
+*.zip
