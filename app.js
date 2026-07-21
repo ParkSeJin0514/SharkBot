@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import bolt from '@slack/bolt';
 import serverlessHttp from 'serverless-http';
+import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime';
+import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 import { installationStore, storeMode } from './installationStore.js';
 
 const { App, ExpressReceiver } = bolt;
@@ -22,6 +24,22 @@ const zendeskEnabled = Boolean(ZENDESK_SUBDOMAIN && ZENDESK_EMAIL && ZENDESK_API
 // 긴급도 값(=Zendesk priority) → 한국어 표시
 const URGENCY_LABEL = { high: '높음', normal: '중간', low: '낮음' };
 
+// ── 실행 환경 / Bedrock ─────────────────────────────────────
+const isLambda = Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+const REGION = process.env.AWS_REGION || 'ap-northeast-2';
+// 콘솔 Bedrock에서 액세스 허용된 모델 ID로 설정 (예: apac.anthropic.claude-... 인퍼런스 프로파일)
+const BEDROCK_MODEL_ID =
+  process.env.BEDROCK_MODEL_ID || 'apac.anthropic.claude-3-5-sonnet-20241022-v2:0';
+const bedrock = new BedrockRuntimeClient({ region: REGION });
+const lambdaClient = new LambdaClient({ region: REGION });
+
+const ASK_SYSTEM_PROMPT = [
+  '당신은 스마일샤크(AWS MSP)의 고객 지원 어시스턴트입니다.',
+  'AWS 사용법·개념 질문에 한국어로 정확하고 간결하게 답하세요.',
+  '가능하면 관련 AWS 서비스명과 근거를 함께 제시하고, 확실하지 않으면 추측하지 말고',
+  '"정확한 확인이 필요하면 /zendesk 로 문의 티켓을 남겨 주세요"라고 안내하세요.',
+].join(' ');
+
 // ── HTTP + OAuth 리시버 (멀티테넌트) ────────────────────────
 const receiver = new ExpressReceiver({
   signingSecret: SLACK_SIGNING_SECRET,
@@ -30,14 +48,14 @@ const receiver = new ExpressReceiver({
   stateSecret: SLACK_STATE_SECRET,
   scopes: ['commands', 'chat:write', 'chat:write.public', 'users:read', 'users:read.email', 'im:write'],
   installationStore,
-  processBeforeResponse: true, // FaaS(Lambda) 필수
+  processBeforeResponse: isLambda, // FaaS(Lambda)에서만 true
   installerOptions: {
     installPath: '/slack/install',
     redirectUriPath: '/slack/oauth_redirect',
   },
 });
 
-const app = new App({ receiver, processBeforeResponse: true });
+const app = new App({ receiver, processBeforeResponse: isLambda });
 
 // ── 1. 슬래시 명령 → 문의 모달 열기 ─────────────────────────
 app.command('/zendesk', async ({ ack, body, client, logger }) => {
@@ -49,6 +67,36 @@ app.command('/zendesk', async ({ ack, body, client, logger }) => {
     });
   } catch (error) {
     logger.error('모달 열기 실패:', error);
+  }
+});
+
+// ── 1-2. /ask → Bedrock 질의 (정적 지식) ────────────────────
+// Slack 3초 제약: 즉시 ack → (Lambda) 비동기 self-invoke로 Bedrock 처리 후 response_url 게시
+app.command('/ask', async ({ ack, command, respond, logger }) => {
+  const question = (command.text || '').trim();
+  if (!question) {
+    await ack('사용법: `/ask 질문내용`  (예: `/ask S3 버킷 정책 설정 방법 알려줘`)');
+    return;
+  }
+  await ack('🤔 답변을 생성하고 있어요...');
+  try {
+    if (isLambda) {
+      await lambdaClient.send(
+        new InvokeCommand({
+          FunctionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
+          InvocationType: 'Event', // 비동기
+          Payload: Buffer.from(
+            JSON.stringify({ __askWorker: true, text: question, response_url: command.response_url })
+          ),
+        })
+      );
+    } else {
+      const answer = await askBedrock(question);
+      await respond({ response_type: 'ephemeral', text: answer });
+    }
+  } catch (error) {
+    logger.error('ask 처리 실패:', error);
+    await respond({ response_type: 'ephemeral', text: `⚠️ 답변 처리 중 오류: ${error.message}` });
   }
 });
 
@@ -174,6 +222,38 @@ async function createZendeskTicket(form, requester) {
   return data.ticket;
 }
 
+// ── 헬퍼: Bedrock 질의 ──────────────────────────────────────
+async function askBedrock(question) {
+  const res = await bedrock.send(
+    new ConverseCommand({
+      modelId: BEDROCK_MODEL_ID,
+      system: [{ text: ASK_SYSTEM_PROMPT }],
+      messages: [{ role: 'user', content: [{ text: question }] }],
+      inferenceConfig: { maxTokens: 1024, temperature: 0.2 },
+    })
+  );
+  return res.output?.message?.content?.[0]?.text || '답변을 생성하지 못했습니다.';
+}
+
+// ── 헬퍼: 비동기 워커 (Bedrock 처리 후 response_url로 게시) ──
+async function handleAskWorker(event) {
+  try {
+    const answer = await askBedrock(event.text);
+    await postToResponseUrl(event.response_url, answer);
+  } catch (e) {
+    await postToResponseUrl(event.response_url, `⚠️ 답변 생성 중 오류가 발생했습니다: ${e.message}`);
+  }
+  return { ok: true };
+}
+
+async function postToResponseUrl(url, text) {
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ response_type: 'ephemeral', replace_original: false, text }),
+  });
+}
+
 // ── 헬퍼: static_select 옵션 생성 ───────────────────────────
 function options(pairs) {
   return pairs.map(([text, value]) => ({
@@ -243,7 +323,14 @@ function buildTicketModal() {
 
 // ── 실행 ────────────────────────────────────────────────────
 // Lambda: handler export / 로컬: HTTP 서버 직접 구동
-export const handler = serverlessHttp(receiver.app);
+const slackHandler = serverlessHttp(receiver.app);
+export const handler = async (event, context) => {
+  // 비동기 self-invoke(워커) 페이로드 처리
+  if (event && event.__askWorker) {
+    return handleAskWorker(event);
+  }
+  return slackHandler(event, context);
+};
 
 if (!process.env.AWS_LAMBDA_FUNCTION_NAME) {
   const port = process.env.PORT || 3000;

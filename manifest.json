@@ -14,6 +14,12 @@
         "command": "/zendesk",
         "description": "스마일샤크에 문의 티켓을 보냅니다",
         "should_escape": false
+      },
+      {
+        "command": "/ask",
+        "description": "AWS 사용법 등 질문에 AI가 답변합니다",
+        "usage_hint": "질문 내용",
+        "should_escape": false
       }
     ]
   },
