@@ -1,7 +1,7 @@
 {
   "display_information": {
     "name": "SharktBot",
-    "description": "SmileShark 전용 Bot",
+    "description": "SmileShark Bot",
     "background_color": "#0a2540"
   },
   "features": {
@@ -11,7 +11,7 @@
     },
     "slash_commands": [
       {
-        "command": "/Zendesk",
+        "command": "/zendesk",
         "description": "스마일샤크에 문의 티켓을 보냅니다",
         "should_escape": false
       }

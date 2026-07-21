@@ -25,7 +25,7 @@ const app = new App({
 });
 
 // ── 1. 슬래시 명령 → 문의 모달 열기 ─────────────────────────
-app.command('/sharkton', async ({ ack, body, client, logger }) => {
+app.command('/zendesk', async ({ ack, body, client, logger }) => {
   await ack();
   try {
     await client.views.open({
