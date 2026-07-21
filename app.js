@@ -210,14 +210,12 @@ app.command('/zendesk-status', async ({ ack, command, client, respond, logger })
 // NOTE: Slack 3초 제약. Zendesk 호출이 느릴 경우 별도 Lambda(async)/SQS로
 //       분리하는 것을 권장. (DEPLOYMENT.md 참고)
 app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
-  await ack();
-
   const userId = body.user.id;
   const v = view.state.values;
   const form = {
     formType: v.form_type.value.selected_option.value,
     techArea: v.tech_area?.value?.selected_option?.value || '',
-    name: v.name.value.value,
+    requesterEmail: (v.requester_email.value.value || '').trim(),
     company: v.company.value.value,
     subject: v.subject.value.value,
     ccEmails: parseEmails(v.cc?.value?.value || ''),
@@ -227,14 +225,23 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
     description: v.description.value.value,
   };
 
+  // 요청자 이메일 형식 검증 → 모달에 인라인 에러 표시 (ack 전에 처리)
+  if (!isEmail(form.requesterEmail)) {
+    await ack({
+      response_action: 'errors',
+      errors: { requester_email: '올바른 이메일 형식을 입력해 주세요. (예: user@company.com)' },
+    });
+    return;
+  }
+  await ack();
+
   try {
-    const slackEmail = (await resolveRequesterEmail(client, userId)) || undefined;
     logger.info(
-      `📨 문의 접수 | Slack ID: ${userId} | 성명: ${form.name} | 회사: ${form.company} | ` +
-        `이메일: ${slackEmail ?? '(없음)'} | 양식: ${form.formType}`
+      `📨 문의 접수 | Slack ID: ${userId} | 요청자: ${form.requesterEmail} | ` +
+        `회사: ${form.company} | 양식: ${form.formType}`
     );
 
-    const ticket = await createZendeskTicket(form, { name: form.name, email: slackEmail });
+    const ticket = await createZendeskTicket(form);
 
     // 양방향 동기화: 티켓 ID ↔ Slack 사용자 매핑 저장 (웹훅 수신 시 회신 대상)
     if (ticket) {
@@ -263,7 +270,8 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
           type: 'section',
           fields: [
             { type: 'mrkdwn', text: `*양식:*\n${form.formType}${form.techArea ? ` (${form.techArea})` : ''}` },
-            { type: 'mrkdwn', text: `*회사/성명:*\n${form.company} / ${form.name}` },
+            { type: 'mrkdwn', text: `*회사:*\n${form.company}` },
+            { type: 'mrkdwn', text: `*요청자:*\n${form.requesterEmail}` },
             { type: 'mrkdwn', text: `*긴급도:*\n${URGENCY_LABEL[form.urgency] ?? form.urgency}` },
             { type: 'mrkdwn', text: `*AWS 계정 ID:*\n${form.awsAccount || '-'}` },
             { type: 'mrkdwn', text: `*서포트 플랜:*\n${form.supportPlan || '-'}` },
@@ -280,6 +288,11 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
   }
 });
 
+// ── 헬퍼: 이메일 형식 검증 ──────────────────────────────────
+function isEmail(s) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((s || '').trim());
+}
+
 // ── 헬퍼: 참조(CC) 이메일 파싱 (쉼표/줄바꿈/공백/세미콜론 구분, 중복·형식오류 제거) ──
 function parseEmails(raw) {
   return [
@@ -287,7 +300,7 @@ function parseEmails(raw) {
       (raw || '')
         .split(/[\s,;]+/)
         .map((s) => s.trim())
-        .filter((s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s))
+        .filter((s) => isEmail(s))
     ),
   ];
 }
@@ -303,7 +316,7 @@ async function resolveRequesterEmail(client, userId) {
 }
 
 // ── 헬퍼: Zendesk 티켓 생성 ─────────────────────────────────
-async function createZendeskTicket(form, requester) {
+async function createZendeskTicket(form) {
   // 제목: 고객이 입력한 제목을 사용하되, 팀 트리아지용으로 [회사명] 접두어를 붙인다.
   const subject = `[${form.company}] ${form.subject}`;
 
@@ -313,7 +326,7 @@ async function createZendeskTicket(form, requester) {
     '────────────',
     `양식: ${form.formType}`,
     `기술 분야: ${form.techArea || '-'}`,
-    `성명: ${form.name}`,
+    `요청자 이메일: ${form.requesterEmail}`,
     `회사명: ${form.company}`,
     `AWS 계정 ID: ${form.awsAccount || '-'}`,
     `AWS 서포트 플랜: ${form.supportPlan || '-'}`,
@@ -339,7 +352,8 @@ async function createZendeskTicket(form, requester) {
       comment: { body: bodyText },
       priority: form.urgency, // high | normal | low
       tags,
-      ...(requester?.email ? { requester: { name: requester.name, email: requester.email } } : {}),
+      // 요청자 = 이메일 기준. 기존 사용자면 매칭(이름 자동), 없으면 이메일로 신규 생성.
+      ...(form.requesterEmail ? { requester: { email: form.requesterEmail } } : {}),
       ...(form.ccEmails?.length ? { collaborators: form.ccEmails } : {}),
     },
   };
@@ -482,14 +496,11 @@ function buildTicketModal() {
       selectInput('tech_area', '기술 분야', options([
         ['AWS'], ['Datadog'], ['NHN'],
       ]), { optional: true, hint: '기술문의인 경우 선택하세요' }),
-      textInput('name', '성명', { placeholder: '고객사 담당자 성명' }),
-      textInput('company', '회사명', { placeholder: '고객사 회사명' }),
-      textInput('cc', '참조 (CC)', {
-        optional: true,
-        multiline: true,
-        placeholder: '참조할 이메일 (여러 명이면 쉼표 또는 줄바꿈으로 구분)',
-        hint: '입력한 이메일이 Zendesk 티켓 참조자로 등록됩니다',
+      textInput('requester_email', '요청자 이메일', {
+        placeholder: '요청자 이메일 주소',
+        hint: 'Zendesk가 이 이메일로 요청자를 매칭합니다',
       }),
+      textInput('company', '회사명', { placeholder: '고객사 회사명' }),
       textInput('aws_account', 'AWS 계정 ID (Account Number)', {
         optional: true,
         multiline: true,
@@ -501,7 +512,13 @@ function buildTicketModal() {
       selectInput('urgency', '긴급도', options([
         ['높음', 'high'], ['중간', 'normal'], ['낮음', 'low'],
       ])),
-      textInput('subject', '제목', { max: 150, placeholder: '문의 제목을 한 줄로 입력하세요 (예: EC2 인스턴스 접속 불가)' }),
+      textInput('cc', '참조 (CC)', {
+        optional: true,
+        multiline: true,
+        placeholder: '참조할 이메일 (여러 명이면 줄바꿈으로 구분)',
+        hint: '입력한 이메일이 Zendesk 티켓 참조자로 등록됩니다',
+      }),
+      textInput('subject', '제목', { max: 150, placeholder: '문의 제목을 입력하세요' }),
       textInput('description', '문의 내용', { multiline: true, max: 3000, placeholder: '문의 상세 내용을 입력하세요' }),
     ],
   };
