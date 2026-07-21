@@ -17,11 +17,18 @@ const idFromInstallation = (i) =>
 const idFromQuery = (q) =>
   q.isEnterpriseInstall && q.enterpriseId ? q.enterpriseId : q.teamId;
 
+// 티켓 매핑 키 (같은 테이블 재사용: id = "ticket:<ticketId>")
+const ticketKey = (ticketId) => `ticket:${ticketId}`;
+
+// 공유 DynamoDB 문서 클라이언트 (TABLE 있을 때만 생성)
+const ddb = TABLE
+  ? DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+      // Slack 설치 객체에 undefined 필드가 있어 저장 실패하는 것 방지
+      marshallOptions: { removeUndefinedValues: true },
+    })
+  : null;
+
 function dynamoStore() {
-  const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
-    // Slack 설치 객체에 undefined 필드가 있어 저장 실패하는 것 방지
-    marshallOptions: { removeUndefinedValues: true },
-  });
   return {
     storeInstallation: async (installation) => {
       await ddb.send(
@@ -65,3 +72,31 @@ function memoryStore() {
 
 export const installationStore = TABLE ? dynamoStore() : memoryStore();
 export const storeMode = TABLE ? 'dynamodb' : 'memory';
+
+// ── 티켓 ↔ Slack 사용자 매핑 (양방향 동기화용) ──────────────
+// 티켓 생성 시 저장 → Zendesk 웹훅 수신 시 조회해 해당 고객 Slack으로 회신
+const ticketMemory = new Map();
+
+// data: { teamId, enterpriseId?, isEnterpriseInstall?, userId }
+export async function storeTicketMapping(ticketId, data) {
+  if (ddb) {
+    await ddb.send(
+      new PutCommand({
+        TableName: TABLE,
+        Item: { id: ticketKey(ticketId), kind: 'ticket_map', ...data },
+      })
+    );
+  } else {
+    ticketMemory.set(String(ticketId), data);
+  }
+}
+
+export async function fetchTicketMapping(ticketId) {
+  if (ddb) {
+    const res = await ddb.send(
+      new GetCommand({ TableName: TABLE, Key: { id: ticketKey(ticketId) } })
+    );
+    return res.Item || null;
+  }
+  return ticketMemory.get(String(ticketId)) || null;
+}

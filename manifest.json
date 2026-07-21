@@ -20,6 +20,11 @@
         "description": "AWS 사용법 등 질문에 AI가 답변합니다",
         "usage_hint": "질문 내용",
         "should_escape": false
+      },
+      {
+        "command": "/zendesk-status",
+        "description": "내가 접수한 문의 티켓의 상태를 조회합니다",
+        "should_escape": false
       }
     ]
   },

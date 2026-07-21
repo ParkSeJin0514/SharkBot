@@ -1,9 +1,16 @@
 import 'dotenv/config';
 import bolt from '@slack/bolt';
+import express from 'express';
+import { WebClient } from '@slack/web-api';
 import serverlessHttp from 'serverless-http';
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
-import { installationStore, storeMode } from './installationStore.js';
+import {
+  installationStore,
+  storeMode,
+  storeTicketMapping,
+  fetchTicketMapping,
+} from './installationStore.js';
 
 const { App, ExpressReceiver } = bolt;
 
@@ -16,6 +23,7 @@ const {
   ZENDESK_SUBDOMAIN,
   ZENDESK_EMAIL,
   ZENDESK_API_TOKEN,
+  ZENDESK_WEBHOOK_TOKEN, // 인바운드 웹훅(양방향 동기화) 검증용 공유 시크릿
 } = process.env;
 
 // Zendesk 미설정 시 티켓 생성은 건너뛰고 콘솔에만 출력(개발 편의용)
@@ -23,6 +31,16 @@ const zendeskEnabled = Boolean(ZENDESK_SUBDOMAIN && ZENDESK_EMAIL && ZENDESK_API
 
 // 긴급도 값(=Zendesk priority) → 한국어 표시
 const URGENCY_LABEL = { high: '높음', normal: '중간', low: '낮음' };
+
+// Zendesk 상태 → 한국어 표시
+const STATUS_LABEL = {
+  new: '🆕 신규',
+  open: '🔧 처리중',
+  pending: '⏳ 고객확인대기',
+  hold: '⏸️ 보류',
+  solved: '✅ 해결됨',
+  closed: '📁 종료',
+};
 
 // ── 실행 환경 / Bedrock ─────────────────────────────────────
 const isLambda = Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
@@ -56,6 +74,65 @@ const receiver = new ExpressReceiver({
 });
 
 const app = new App({ receiver, processBeforeResponse: isLambda });
+
+// ── 양방향 동기화: Zendesk 웹훅 수신 → 고객 Slack DM 회신 (기능 A) ──
+// Zendesk 트리거가 담당자 "공개 댓글" 등록 시 이 엔드포인트로 JSON을 POST한다.
+// 페이로드 예: { ticket_id, comment, author_role, status, subject }
+receiver.app.post('/zendesk/webhook', express.json(), async (req, res) => {
+  // 1) 공유 시크릿 검증 (Zendesk 웹훅 커스텀 헤더 X-Sharkbot-Token)
+  const token = req.get('x-sharkbot-token');
+  if (!ZENDESK_WEBHOOK_TOKEN || token !== ZENDESK_WEBHOOK_TOKEN) {
+    return res.status(401).send('unauthorized');
+  }
+
+  const { ticket_id, comment, author_role, status, subject } = req.body || {};
+  if (!ticket_id) return res.status(400).send('missing ticket_id');
+
+  // 2) 담당자(agent/admin) 답변만 전달 — 고객 본인 코멘트 echo 방지
+  if (author_role && !['agent', 'admin'].includes(String(author_role).toLowerCase())) {
+    return res.status(200).send('skipped (non-agent)');
+  }
+
+  try {
+    const map = await fetchTicketMapping(ticket_id);
+    if (!map) return res.status(200).send('no mapping'); // 봇 외 경로로 생성된 티켓
+
+    const installation = await installationStore.fetchInstallation({
+      teamId: map.teamId,
+      enterpriseId: map.enterpriseId,
+      isEnterpriseInstall: map.isEnterpriseInstall,
+    });
+    const botToken = installation?.bot?.token;
+    if (!botToken) return res.status(200).send('no bot token');
+
+    const web = new WebClient(botToken);
+    await web.chat.postMessage({
+      channel: map.userId,
+      text: `💬 티켓 #${ticket_id} 에 담당자 답변이 등록되었습니다.`,
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `💬 *티켓 #${ticket_id} 에 담당자 답변이 등록되었어요.*` + (subject ? `\n_${subject}_` : ''),
+          },
+        },
+        { type: 'section', text: { type: 'mrkdwn', text: comment ? truncate(comment, 2800) : '(내용 없음)' } },
+        {
+          type: 'context',
+          elements: [
+            { type: 'mrkdwn', text: `상태: ${STATUS_LABEL[status] || status || '-'}   ·   \`/zendesk-status\` 로 전체 확인` },
+          ],
+        },
+      ],
+    });
+    return res.status(200).send('ok');
+  } catch (e) {
+    // Zendesk 재시도 폭주 방지를 위해 200 반환하고 로그로 추적
+    console.error('Zendesk 웹훅 처리 실패:', e);
+    return res.status(200).send('error-logged');
+  }
+});
 
 // ── 1. 슬래시 명령 → 문의 모달 열기 ─────────────────────────
 app.command('/zendesk', async ({ ack, body, client, logger }) => {
@@ -100,6 +177,35 @@ app.command('/ask', async ({ ack, command, respond, logger }) => {
   }
 });
 
+// ── 1-3. /zendesk-status → 내 티켓 상태 조회 (기능 B) ───────
+// 요청자(Slack 이메일)로 Zendesk를 검색해 본인 티켓 목록·상태를 반환.
+app.command('/zendesk-status', async ({ ack, command, client, respond, logger }) => {
+  await ack();
+  try {
+    if (!zendeskEnabled) {
+      await respond({ response_type: 'ephemeral', text: '(개발 모드) Zendesk 미연동 상태라 조회할 수 없습니다.' });
+      return;
+    }
+    const email = await resolveRequesterEmail(client, command.user_id);
+    if (!email) {
+      await respond({
+        response_type: 'ephemeral',
+        text: '⚠️ Slack 프로필에 이메일이 없어 티켓을 조회할 수 없습니다. 프로필 이메일을 확인해 주세요.',
+      });
+      return;
+    }
+    const tickets = await listZendeskTickets(email);
+    if (!tickets.length) {
+      await respond({ response_type: 'ephemeral', text: `📭 *${email}* 로 조회된 티켓이 없습니다.` });
+      return;
+    }
+    await respond({ response_type: 'ephemeral', text: `열린 티켓 ${tickets.length}건`, blocks: buildStatusBlocks(tickets, email) });
+  } catch (error) {
+    logger.error('상태 조회 실패:', error);
+    await respond({ response_type: 'ephemeral', text: `⚠️ 티켓 조회 중 오류가 발생했습니다: ${error.message}` });
+  }
+});
+
 // ── 2. 모달 제출 → Zendesk 티켓 생성 ────────────────────────
 // NOTE: Slack 3초 제약. Zendesk 호출이 느릴 경우 별도 Lambda(async)/SQS로
 //       분리하는 것을 권장. (DEPLOYMENT.md 참고)
@@ -127,6 +233,20 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
     );
 
     const ticket = await createZendeskTicket(form, { name: form.name, email: slackEmail });
+
+    // 양방향 동기화: 티켓 ID ↔ Slack 사용자 매핑 저장 (웹훅 수신 시 회신 대상)
+    if (ticket) {
+      try {
+        await storeTicketMapping(ticket.id, {
+          teamId: body.team?.id,
+          enterpriseId: body.enterprise?.id,
+          isEnterpriseInstall: Boolean(body.is_enterprise_install),
+          userId,
+        });
+      } catch (e) {
+        logger.error('티켓 매핑 저장 실패(회신 동기화 불가):', e);
+      }
+    }
 
     const idText = ticket
       ? `티켓 *#${ticket.id}* 이(가) 생성되었습니다.`
@@ -207,10 +327,9 @@ async function createZendeskTicket(form, requester) {
     },
   };
 
-  const auth = Buffer.from(`${ZENDESK_EMAIL}/token:${ZENDESK_API_TOKEN}`).toString('base64');
   const res = await fetch(`https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json`, {
     method: 'POST',
-    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Basic ${zendeskAuth()}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
 
@@ -220,6 +339,49 @@ async function createZendeskTicket(form, requester) {
   }
   const data = await res.json();
   return data.ticket;
+}
+
+// ── 헬퍼: Zendesk Basic 인증 헤더 값 ────────────────────────
+function zendeskAuth() {
+  return Buffer.from(`${ZENDESK_EMAIL}/token:${ZENDESK_API_TOKEN}`).toString('base64');
+}
+
+// ── 헬퍼: 요청자 이메일로 티켓 목록 조회 (기능 B) ───────────
+async function listZendeskTickets(email, limit = 10) {
+  const query = encodeURIComponent(`type:ticket requester:${email}`);
+  const url =
+    `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json` +
+    `?query=${query}&sort_by=created_at&sort_order=desc`;
+  const res = await fetch(url, { headers: { Authorization: `Basic ${zendeskAuth()}` } });
+  if (!res.ok) throw new Error(`Zendesk search ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  return (data.results || []).slice(0, limit);
+}
+
+// ── 헬퍼: 티켓 상태 목록 → Slack 블록 ───────────────────────
+function buildStatusBlocks(tickets, email) {
+  const blocks = [
+    { type: 'section', text: { type: 'mrkdwn', text: `📋 *${email}* 님의 최근 티켓 ${tickets.length}건` } },
+    { type: 'divider' },
+  ];
+  for (const t of tickets) {
+    const status = STATUS_LABEL[t.status] || t.status || '-';
+    const created = (t.created_at || '').slice(0, 10);
+    blocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*#${t.id}* · ${status}\n${t.subject || '(제목 없음)'}\n_생성일: ${created}_`,
+      },
+    });
+  }
+  return blocks;
+}
+
+// ── 헬퍼: 문자열 길이 제한 ──────────────────────────────────
+function truncate(s, n) {
+  if (typeof s !== 'string') return '';
+  return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
 // ── 헬퍼: Bedrock 질의 ──────────────────────────────────────

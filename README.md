@@ -1,75 +1,75 @@
-# SharkBot (기능 1: Zendesk 티켓 발행)
+# SharkBot
 
-Slack `/zendesk` 명령 → 문의 폼(모달) → Zendesk 티켓 자동 생성.
-여러 고객사 Slack에 배포하는 **HTTP + OAuth 멀티테넌트** 봇.
+고객사가 **자기 회사 Slack에서** AWS 콘솔·Zendesk 포털을 거치지 않고, 스마일샤크에 문의를 보내고 진행 상황까지 확인할 수 있게 하는 **멀티테넌트 Slack 봇**.
+
+여러 고객사가 각자 워크스페이스에 설치(OAuth)해 사용하며, **HTTP + OAuth** 방식으로 AWS(Lambda)에 서버리스로 배포된다.
 
 ## 아키텍처
-```
-[고객사 Slack] ─ HTTPS ─► API Gateway ─► Lambda (Bolt, HTTP 모드)
-                                            ├─ DynamoDB (고객사별 설치 토큰)
-                                            └─ Zendesk API (티켓 생성)
-```
-- 고객이 `/slack/install`로 설치(OAuth) → 워크스페이스별 봇 토큰이 **DynamoDB**에 저장
-- 요청이 오면 team_id로 해당 토큰을 조회해 응답 (멀티테넌트)
 
-## 구성 파일
-| 파일 | 역할 |
+```
+                    ┌───────────────────────────────────────────────┐
+[고객사 A/B/C Slack] │  /zendesk         (티켓 발행 모달)              │
+        │           │  /zendesk-status  (내 티켓 상태 조회)           │
+        │  HTTPS    │  /ask             (AWS 질문 → AI 답변)          │
+        └──────────►│  API Gateway ──► Lambda (Bolt, HTTP + OAuth)    │
+                    │                     ├─ DynamoDB                 │
+                    │                     │    · 고객사별 설치 토큰     │
+                    │                     │    · 티켓 ↔ Slack 매핑     │
+                    │                     ├─ Zendesk API (생성/검색)   │
+                    │                     └─ Bedrock (AI 답변)         │
+                    └───────────────────────────────────────────────┘
+
+[담당자] Zendesk 공개답변 ─ 트리거 ─► 웹훅 POST /zendesk/webhook ─► Lambda ─► 고객 Slack DM 회신
+```
+
+- **설치**: 고객이 `/slack/install`로 OAuth 승인 → 워크스페이스별 봇 토큰을 **DynamoDB**에 저장
+- **멀티테넌트**: 요청의 team_id로 해당 고객사 토큰을 조회해 응답 → 여러 고객사에 동시 배포
+- **결정론적 분기**: 슬래시 커맨드로 요청 성격을 명시적으로 나눠(`/zendesk` 폼 vs `/ask` AI) 오분류를 원천 차단
+
+## 기능
+
+| 커맨드 / 흐름 | 설명 | 상태 |
+|---|---|---|
+| **`/zendesk`** | 문의 폼(모달) 작성 → Zendesk 티켓 자동 생성, 티켓 번호 회신 | ✅ 운영 |
+| **`/zendesk-status`** | 요청자(Slack 이메일) 기준으로 본인 티켓 목록·상태 조회 (한글 상태 표기) | ✅ 배포 |
+| **양방향 동기화** | 담당자가 Zendesk에서 공개 답변하면 고객 Slack DM으로 자동 회신 | ⏸️ 코드 완료 / 설정 대기 |
+| **`/ask`** | AWS 사용법·개념 질문에 Bedrock 기반 AI가 한국어로 답변 | ⏸️ 코드 완료 / SCP 대기 |
+
+### `/zendesk` 문의 폼 필드
+양식 · 기술 분야(AWS/Datadog/NHN) · 성명 · 회사명 · AWS 계정 ID · AWS 서포트 플랜 · 긴급도 · 문의 내용
+- **요청자(requester)**: 성명 + Slack 이메일로 Zendesk 티켓에 매핑
+- **제목**: `[회사명] 양식(기술분야) - 성명` 자동 생성
+- 폼 값은 티켓 **본문 + 태그**로 전달 (Zendesk 커스텀 필드 ID 확보 시 정식 매핑 예정)
+
+### 양방향 동기화 동작
+1. `/zendesk` 티켓 생성 시 `티켓 ID ↔ Slack 사용자` 매핑을 DynamoDB에 저장 (기존 테이블 재사용)
+2. Zendesk 트리거가 **담당자 공개 답변** 시 웹훅(`/zendesk/webhook`) 호출
+3. Lambda가 매핑을 조회해 해당 고객 워크스페이스 봇 토큰으로 **Slack DM 회신**
+- 웹훅은 커스텀 헤더 시크릿으로 검증, 담당자(agent/admin) 답변만 전달(고객 본인 코멘트 echo 방지)
+
+## 구성 요소
+
+| 구성 | 역할 |
 |---|---|
-| `app.js` | Bolt 앱 (ExpressReceiver + OAuth), Lambda `handler` export |
-| `installationStore.js` | 고객별 설치 토큰 저장소 (DynamoDB / 로컬은 메모리 폴백) |
-| `manifest.json` | Slack 앱 설정 참고용 |
+| `app.js` | Bolt 앱 — ExpressReceiver(OAuth) + 슬래시 커맨드/모달/웹훅 라우트 + Lambda `handler` |
+| `installationStore.js` | 고객사별 설치 토큰 + 티켓 매핑 저장 (DynamoDB / 로컬은 메모리 폴백) |
+| `manifest.json` | Slack 앱 설정(커맨드·스코프) 정의 |
+| API Gateway (HTTP API) | 공개 HTTPS 엔드포인트 → Lambda 프록시 |
+| Lambda `sharkbot` | 실행 런타임 (Node.js 22.x, `app.handler`) |
+| DynamoDB `sharkbot-installations` | 설치 토큰 + 티켓↔사용자 매핑 저장 |
 
-## 환경 변수 (`.env`)
-```
-SLACK_SIGNING_SECRET=      # Slack 앱 Basic Information → App Credentials
-SLACK_CLIENT_ID=           # 동일
-SLACK_CLIENT_SECRET=       # 동일
-SLACK_STATE_SECRET=        # OAuth 보안용 임의의 랜덤 문자열 (직접 생성)
-ZENDESK_SUBDOMAIN=         # abc.zendesk.com 이면 abc
-ZENDESK_EMAIL=             # API 토큰 발급 상담원 이메일
-ZENDESK_API_TOKEN=         # Zendesk Admin → Apps and integrations → APIs → Zendesk API
-# INSTALL_TABLE=sharkbot-installations   # 있으면 DynamoDB, 없으면 메모리(로컬)
-```
-> `.env`는 로컬 개발용. 프로덕션(Lambda)에서는 콘솔 환경변수로 주입한다.
+**기술 스택**: Node.js · Slack Bolt(HTTP + OAuth) · AWS Lambda / API Gateway / DynamoDB · Zendesk API · Amazon Bedrock
 
-## 필요 권한 (OAuth 스코프)
+## OAuth 스코프
+
 | 스코프 | 용도 |
 |---|---|
-| `commands` | 슬래시 명령 `/zendesk` |
-| `chat:write` / `chat:write.public` | 메시지 회신 |
+| `commands` | 슬래시 명령 (`/zendesk`, `/zendesk-status`, `/ask`) |
+| `chat:write` / `chat:write.public` | 메시지·DM 회신 |
 | `users:read` / `users:read.email` | 요청자(고객) 이메일 매핑 |
 | `im:write` | DM 회신 |
 
-## 로컬 개발
-HTTP 모드라 Slack이 접근하려면 공개 URL(ngrok 등)이 필요하다.
-```bash
-npm install
-npm start          # 로컬 HTTP 서버 :3000 (설치 저장소=메모리)
-```
-- `npm start` → `http://localhost:3000/slack/install` 로 설치 (ngrok로 공개 후 Slack Request URL 등록 필요)
-- `INSTALL_TABLE` 미설정 시 메모리 저장소(재시작 시 초기화)
+## 문서
 
-## 프로덕션 배포 (AWS 콘솔)
-Lambda + API Gateway + DynamoDB 구성. 상세 절차는 **[../Progress/DEPLOYMENT.md](../Progress/DEPLOYMENT.md)** 참고.
-
-배포용 zip 생성:
-```bash
-rm -f sharkbot.zip
-zip -r sharkbot.zip app.js installationStore.js package.json package-lock.json node_modules -x '*.DS_Store'
-```
-→ Lambda 콘솔 **Code → Upload from → .zip file** 로 업로드. (Handler: `app.handler`)
-
-## 설치 & 테스트
-1. `<InvokeURL>/slack/install` 접속 → 워크스페이스 설치 승인
-   → DynamoDB `sharkbot-installations`에 토큰 저장
-2. Slack에서 **`/zendesk`** → 폼 작성 → 제출 → Zendesk 티켓 생성 확인
-
-## 문의 폼 필드
-양식 · 기술 분야(AWS/Datadog/NHN) · 성명 · 회사명 · AWS 계정 ID · AWS 서포트 플랜 · 긴급도 · 문의 내용
-- **요청자(requester)**: 성명 + Slack 이메일로 Zendesk 티켓에 매핑
-- 현재 폼 값은 티켓 **본문 + 태그**로 전달 (Zendesk 커스텀 필드 ID 확보 시 정식 매핑 예정)
-
-## 남은 하드닝 / TODO
-- **3초 응답 제약**: Zendesk 호출이 느리면 제출 즉시 `ack` 후 티켓 생성을 비동기(별도 Lambda/SQS)로 분리
-- 자격증명 콘솔 환경변수 → **Secrets Manager**
-- Zendesk 커스텀 필드(양식·계정ID 등) 정식 매핑
+- 배포 절차 (AWS 콘솔): [../Progress/DEPLOYMENT.md](../Progress/DEPLOYMENT.md)
+- 기능별 설계·진행 현황: [../Progress/](../Progress/) (`00-overview.md` ~ `04-*.md`)
