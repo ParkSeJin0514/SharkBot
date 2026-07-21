@@ -51,7 +51,6 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
     awsAccount: v.aws_account?.value?.value || '',
     supportPlan: v.support_plan?.value?.selected_option?.value || '',
     urgency: v.urgency.value.selected_option.value, // high | normal | low
-    supportLevel: v.support_level.value.selected_option.value,
     description: v.description.value.value,
   };
 
@@ -59,7 +58,7 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
     const slackEmail = (await resolveRequesterEmail(client, userId)) || undefined;
     logger.info(
       `📨 문의 접수 | Slack ID: ${userId} | 성명: ${form.name} | 회사: ${form.company} | ` +
-        `이메일: ${slackEmail ?? '(없음)'} | 양식: ${form.formType} | 지원수준: ${form.supportLevel}`
+        `이메일: ${slackEmail ?? '(없음)'} | 양식: ${form.formType}`
     );
 
     const ticket = await createZendeskTicket(form, { name: form.name, email: slackEmail });
@@ -77,7 +76,6 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
           type: 'section',
           fields: [
             { type: 'mrkdwn', text: `*양식:*\n${form.formType}${form.techArea ? ` (${form.techArea})` : ''}` },
-            { type: 'mrkdwn', text: `*지원수준:*\n${form.supportLevel}` },
             { type: 'mrkdwn', text: `*회사/성명:*\n${form.company} / ${form.name}` },
             { type: 'mrkdwn', text: `*긴급도:*\n${URGENCY_LABEL[form.urgency] ?? form.urgency}` },
             { type: 'mrkdwn', text: `*AWS 계정 ID:*\n${form.awsAccount || '-'}` },
@@ -107,7 +105,7 @@ async function resolveRequesterEmail(client, userId) {
 
 // ── 헬퍼: Zendesk 티켓 생성 ─────────────────────────────────
 async function createZendeskTicket(form, requester) {
-  const subject = `[${form.company}] ${form.formType}${form.techArea ? `(${form.techArea})` : ''} - ${form.supportLevel}`;
+  const subject = `[${form.company}] ${form.formType}${form.techArea ? `(${form.techArea})` : ''} - ${form.name}`;
 
   const bodyText = [
     form.description,
@@ -120,7 +118,6 @@ async function createZendeskTicket(form, requester) {
     `AWS 계정 ID: ${form.awsAccount || '-'}`,
     `AWS 서포트 플랜: ${form.supportPlan || '-'}`,
     `긴급도: ${URGENCY_LABEL[form.urgency] ?? form.urgency}`,
-    `지원수준: ${form.supportLevel}`,
     '(Sharkton 봇에서 자동 생성)',
   ].join('\n');
 
@@ -129,9 +126,9 @@ async function createZendeskTicket(form, requester) {
     return null;
   }
 
-  // TODO: Zendesk 커스텀 필드(양식·지원수준·계정ID 등)의 field ID를 확보하면
+  // TODO: Zendesk 커스텀 필드(양식·계정ID 등)의 field ID를 확보하면
   //       custom_fields: [{ id, value }] 로 정식 매핑 예정. 현재는 본문+태그로 처리.
-  const tags = ['sharkton', form.formType, form.techArea, form.supportLevel]
+  const tags = ['sharkton', form.formType, form.techArea]
     .filter(Boolean)
     .map((t) => t.replace(/\s+/g, '_'));
 
@@ -199,14 +196,14 @@ function buildTicketModal() {
   return {
     type: 'modal',
     callback_id: 'ticket_modal',
-    title: { type: 'plain_text', text: '스마일샤크 문의' },
+    title: { type: 'plain_text', text: '젠데스크 문의' },
     submit: { type: 'plain_text', text: '문의 접수' },
     close: { type: 'plain_text', text: '취소' },
     blocks: [
       selectInput('form_type', '양식', options([
         ['기술문의'], ['비용문의'], ['샤크몬 문의'], ['내부문서요청'], ['인시던트'], ['미팅협의'],
       ])),
-      selectInput('tech_area', '기술 분야 (기술문의 시)', options([
+      selectInput('tech_area', '기술 분야', options([
         ['AWS'], ['Datadog'], ['NHN'],
       ]), { optional: true, hint: '기술문의인 경우 선택하세요' }),
       textInput('name', '성명', { placeholder: '고객사 담당자 성명' }),
@@ -215,7 +212,6 @@ function buildTicketModal() {
         optional: true,
         multiline: true,
         placeholder: '작업 필요한 계정 ID (여러 개면 줄바꿈으로 구분)',
-        hint: '중복/여러 개 입력 가능 — 한 줄에 하나씩',
       }),
       selectInput('support_plan', 'AWS 서포트 플랜', options([
         ['Basic'], ['Developer'], ['Business'], ['Enterprise On-Ramp'], ['Enterprise'],
@@ -223,10 +219,7 @@ function buildTicketModal() {
       selectInput('urgency', '긴급도', options([
         ['높음', 'high'], ['중간', 'normal'], ['낮음', 'low'],
       ])),
-      selectInput('support_level', '지원수준', options([
-        ['일반문의'], ['101'], ['201'], ['301'], ['내부문의'],
-      ])),
-      textInput('description', '문의 내용', { multiline: true, max: 3000, placeholder: '문의 상세 내용을 입력하세요' }),
+      textInput('description', '문의 내용', { multiline: true, max: 5000, placeholder: '문의 상세 내용을 입력하세요' }),
     ],
   };
 }
