@@ -219,6 +219,8 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
     techArea: v.tech_area?.value?.selected_option?.value || '',
     name: v.name.value.value,
     company: v.company.value.value,
+    subject: v.subject.value.value,
+    ccEmails: parseEmails(v.cc?.value?.value || ''),
     awsAccount: v.aws_account?.value?.value || '',
     supportPlan: v.support_plan?.value?.selected_option?.value || '',
     urgency: v.urgency.value.selected_option.value, // high | normal | low
@@ -278,6 +280,18 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
   }
 });
 
+// ── 헬퍼: 참조(CC) 이메일 파싱 (쉼표/줄바꿈/공백/세미콜론 구분, 중복·형식오류 제거) ──
+function parseEmails(raw) {
+  return [
+    ...new Set(
+      (raw || '')
+        .split(/[\s,;]+/)
+        .map((s) => s.trim())
+        .filter((s) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s))
+    ),
+  ];
+}
+
 // ── 헬퍼: 요청자(고객) 이메일 조회 ──────────────────────────
 async function resolveRequesterEmail(client, userId) {
   try {
@@ -290,7 +304,8 @@ async function resolveRequesterEmail(client, userId) {
 
 // ── 헬퍼: Zendesk 티켓 생성 ─────────────────────────────────
 async function createZendeskTicket(form, requester) {
-  const subject = `[${form.company}] ${form.formType}${form.techArea ? `(${form.techArea})` : ''} - ${form.name}`;
+  // 제목: 고객이 입력한 제목을 사용하되, 팀 트리아지용으로 [회사명] 접두어를 붙인다.
+  const subject = `[${form.company}] ${form.subject}`;
 
   const bodyText = [
     form.description,
@@ -303,6 +318,7 @@ async function createZendeskTicket(form, requester) {
     `AWS 계정 ID: ${form.awsAccount || '-'}`,
     `AWS 서포트 플랜: ${form.supportPlan || '-'}`,
     `긴급도: ${URGENCY_LABEL[form.urgency] ?? form.urgency}`,
+    `참조(CC): ${form.ccEmails?.length ? form.ccEmails.join(', ') : '-'}`,
     '(Sharkton 봇에서 자동 생성)',
   ].join('\n');
 
@@ -324,6 +340,7 @@ async function createZendeskTicket(form, requester) {
       priority: form.urgency, // high | normal | low
       tags,
       ...(requester?.email ? { requester: { name: requester.name, email: requester.email } } : {}),
+      ...(form.ccEmails?.length ? { collaborators: form.ccEmails } : {}),
     },
   };
 
@@ -467,6 +484,12 @@ function buildTicketModal() {
       ]), { optional: true, hint: '기술문의인 경우 선택하세요' }),
       textInput('name', '성명', { placeholder: '고객사 담당자 성명' }),
       textInput('company', '회사명', { placeholder: '고객사 회사명' }),
+      textInput('cc', '참조 (CC)', {
+        optional: true,
+        multiline: true,
+        placeholder: '참조할 이메일 (여러 명이면 쉼표 또는 줄바꿈으로 구분)',
+        hint: '입력한 이메일이 Zendesk 티켓 참조자로 등록됩니다',
+      }),
       textInput('aws_account', 'AWS 계정 ID (Account Number)', {
         optional: true,
         multiline: true,
@@ -478,6 +501,7 @@ function buildTicketModal() {
       selectInput('urgency', '긴급도', options([
         ['높음', 'high'], ['중간', 'normal'], ['낮음', 'low'],
       ])),
+      textInput('subject', '제목', { max: 150, placeholder: '문의 제목을 한 줄로 입력하세요 (예: EC2 인스턴스 접속 불가)' }),
       textInput('description', '문의 내용', { multiline: true, max: 3000, placeholder: '문의 상세 내용을 입력하세요' }),
     ],
   };
