@@ -1,12 +1,16 @@
 import 'dotenv/config';
 import bolt from '@slack/bolt';
+import serverlessHttp from 'serverless-http';
+import { installationStore, storeMode } from './installationStore.js';
 
-const { App } = bolt;
+const { App, ExpressReceiver } = bolt;
 
 // ── 환경 변수 ──────────────────────────────────────────────
 const {
-  SLACK_BOT_TOKEN,
-  SLACK_APP_TOKEN,
+  SLACK_SIGNING_SECRET,
+  SLACK_CLIENT_ID,
+  SLACK_CLIENT_SECRET,
+  SLACK_STATE_SECRET,
   ZENDESK_SUBDOMAIN,
   ZENDESK_EMAIL,
   ZENDESK_API_TOKEN,
@@ -18,11 +22,22 @@ const zendeskEnabled = Boolean(ZENDESK_SUBDOMAIN && ZENDESK_EMAIL && ZENDESK_API
 // 긴급도 값(=Zendesk priority) → 한국어 표시
 const URGENCY_LABEL = { high: '높음', normal: '중간', low: '낮음' };
 
-const app = new App({
-  token: SLACK_BOT_TOKEN,
-  appToken: SLACK_APP_TOKEN,
-  socketMode: true,
+// ── HTTP + OAuth 리시버 (멀티테넌트) ────────────────────────
+const receiver = new ExpressReceiver({
+  signingSecret: SLACK_SIGNING_SECRET,
+  clientId: SLACK_CLIENT_ID,
+  clientSecret: SLACK_CLIENT_SECRET,
+  stateSecret: SLACK_STATE_SECRET,
+  scopes: ['commands', 'chat:write', 'chat:write.public', 'users:read', 'users:read.email', 'im:write'],
+  installationStore,
+  processBeforeResponse: true, // FaaS(Lambda) 필수
+  installerOptions: {
+    installPath: '/slack/install',
+    redirectUriPath: '/slack/oauth_redirect',
+  },
 });
+
+const app = new App({ receiver, processBeforeResponse: true });
 
 // ── 1. 슬래시 명령 → 문의 모달 열기 ─────────────────────────
 app.command('/zendesk', async ({ ack, body, client, logger }) => {
@@ -38,6 +53,8 @@ app.command('/zendesk', async ({ ack, body, client, logger }) => {
 });
 
 // ── 2. 모달 제출 → Zendesk 티켓 생성 ────────────────────────
+// NOTE: Slack 3초 제약. Zendesk 호출이 느릴 경우 별도 Lambda(async)/SQS로
+//       분리하는 것을 권장. (DEPLOYMENT.md 참고)
 app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
   await ack();
 
@@ -225,8 +242,15 @@ function buildTicketModal() {
 }
 
 // ── 실행 ────────────────────────────────────────────────────
-(async () => {
-  await app.start();
-  console.log('⚡ SharkBot이 실행되었습니다. (Socket Mode)');
-  console.log(`   Zendesk 연동: ${zendeskEnabled ? 'ON' : 'OFF (개발 모드)'}`);
-})();
+// Lambda: handler export / 로컬: HTTP 서버 직접 구동
+export const handler = serverlessHttp(receiver.app);
+
+if (!process.env.AWS_LAMBDA_FUNCTION_NAME) {
+  const port = process.env.PORT || 3000;
+  receiver.app.listen(port, () => {
+    console.log(`⚡ SharkBot 로컬 실행 (HTTP :${port})`);
+    console.log(`   설치 시작 URL: http://localhost:${port}/slack/install`);
+    console.log(`   설치 저장소: ${storeMode}`);
+    console.log(`   Zendesk 연동: ${zendeskEnabled ? 'ON' : 'OFF (개발 모드)'}`);
+  });
+}

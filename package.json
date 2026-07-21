@@ -8,7 +8,11 @@
     "start": "node app.js"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1091.0",
+    "@aws-sdk/lib-dynamodb": "^3.1091.0",
     "@slack/bolt": "^4.2.0",
-    "dotenv": "^16.4.5"
+    "@slack/oauth": "^4.0.0",
+    "dotenv": "^16.4.5",
+    "serverless-http": "^4.0.0"
   }
 }
