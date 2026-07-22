@@ -64,7 +64,7 @@ const receiver = new ExpressReceiver({
   clientId: SLACK_CLIENT_ID,
   clientSecret: SLACK_CLIENT_SECRET,
   stateSecret: SLACK_STATE_SECRET,
-  scopes: ['commands', 'chat:write', 'chat:write.public', 'users:read', 'users:read.email', 'im:write'],
+  scopes: ['commands', 'chat:write', 'chat:write.public', 'users:read', 'users:read.email', 'im:write', 'files:read', 'files:write'],
   installationStore,
   processBeforeResponse: isLambda, // FaaS(Lambda)에서만 true
   installerOptions: {
@@ -105,9 +105,27 @@ receiver.app.post('/zendesk/webhook', express.json(), async (req, res) => {
     const botToken = installation?.bot?.token;
     if (!botToken) return res.status(200).send('no bot token');
 
+    // 트리거 페이로드는 첨부를 안 실어주므로, 최근 공개 코멘트를 Zendesk API로 조회해
+    // 텍스트 + 첨부(content_url)를 확보한다. (실패 시 페이로드 텍스트로 폴백)
+    let commentText = comment;
+    let attachments = [];
+    try {
+      const latest = await fetchLatestPublicComment(ticket_id);
+      if (latest) {
+        commentText = latest.body || comment;
+        attachments = latest.attachments || [];
+      }
+    } catch (e) {
+      console.error('최근 코멘트 조회 실패(페이로드 텍스트로 대체):', e);
+    }
+
     const web = new WebClient(botToken);
+    // 첨부 업로드(files.uploadV2)에는 DM 채널 ID가 필요 → IM 채널 오픈
+    const im = await web.conversations.open({ users: map.userId });
+    const channelId = im.channel?.id || map.userId;
+
     await web.chat.postMessage({
-      channel: map.userId,
+      channel: channelId,
       text: `💬 티켓 #${ticket_id} 에 담당자 답변이 등록되었습니다.`,
       blocks: [
         {
@@ -117,7 +135,8 @@ receiver.app.post('/zendesk/webhook', express.json(), async (req, res) => {
             text: `💬 *티켓 #${ticket_id} 에 담당자 답변이 등록되었어요.*` + (subject ? `\n_${subject}_` : ''),
           },
         },
-        { type: 'section', text: { type: 'mrkdwn', text: comment ? truncate(comment, 2800) : '(내용 없음)' } },
+        { type: 'section', text: { type: 'mrkdwn', text: commentText ? truncate(commentText, 2800) : '(내용 없음)' } },
+        replyButton(ticket_id),
         {
           type: 'context',
           elements: [
@@ -126,6 +145,11 @@ receiver.app.post('/zendesk/webhook', express.json(), async (req, res) => {
         },
       ],
     });
+
+    // 담당자 첨부(사진 등)를 고객 Slack DM에 이미지로 업로드 (files:write 필요)
+    if (attachments.length) {
+      await uploadZendeskAttachmentsToSlack(web, channelId, attachments);
+    }
     return res.status(200).send('ok');
   } catch (e) {
     // Zendesk 재시도 폭주 방지를 위해 200 반환하고 로그로 추적
@@ -144,6 +168,65 @@ app.command('/zendesk', async ({ ack, body, client, logger }) => {
     });
   } catch (error) {
     logger.error('모달 열기 실패:', error);
+  }
+});
+
+// ── 1-1. 답장 버튼 → 답장 모달 열기 (새 티켓 없이 기존 티켓에 이어쓰기) ──
+app.action('reply_ticket', async ({ ack, body, client, logger }) => {
+  await ack();
+  const ticketId = body.actions?.[0]?.value;
+  try {
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: 'modal',
+        callback_id: 'reply_modal',
+        private_metadata: String(ticketId), // 어느 티켓에 답장인지 보관
+        title: { type: 'plain_text', text: `티켓 #${ticketId} 답장` },
+        submit: { type: 'plain_text', text: '전송' },
+        close: { type: 'plain_text', text: '취소' },
+        blocks: [
+          textInput('reply_text', '답장 내용', {
+            multiline: true,
+            max: 3000,
+            placeholder: '담당자에게 전달할 내용을 입력하세요',
+          }),
+          fileInputBlock('reply_attachments', '사진/파일 첨부'),
+        ],
+      },
+    });
+  } catch (error) {
+    logger.error('답장 모달 열기 실패:', error);
+  }
+});
+
+// ── 1-1b. 답장 모달 제출 → 기존 티켓에 공개 코멘트 추가 ──────
+app.view('reply_modal', async ({ ack, body, view, client, context, logger }) => {
+  await ack();
+  const userId = body.user.id;
+  const ticketId = view.private_metadata;
+  const text = view.state.values.reply_text.value.value;
+  const files = parseAttachments(view.state.values.reply_attachments?.files);
+  try {
+    let uploadToken = null;
+    if (files.length) {
+      try {
+        uploadToken = await uploadFilesToZendesk(files, context.botToken);
+      } catch (e) {
+        logger.error('답장 첨부 업로드 실패(첨부 없이 코멘트 진행):', e);
+      }
+    }
+    await addZendeskComment(ticketId, text, userId, uploadToken);
+    await client.chat.postMessage({
+      channel: userId,
+      text: `✅ 티켓 *#${ticketId}* 에 답장을 전달했어요.`,
+    });
+  } catch (error) {
+    logger.error('답장 코멘트 추가 실패:', error);
+    await client.chat.postMessage({
+      channel: userId,
+      text: `⚠️ 티켓 #${ticketId} 답장 전송 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.`,
+    });
   }
 });
 
@@ -209,7 +292,7 @@ app.command('/zendesk-status', async ({ ack, command, client, respond, logger })
 // ── 2. 모달 제출 → Zendesk 티켓 생성 ────────────────────────
 // NOTE: Slack 3초 제약. Zendesk 호출이 느릴 경우 별도 Lambda(async)/SQS로
 //       분리하는 것을 권장. (DEPLOYMENT.md 참고)
-app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
+app.view('ticket_modal', async ({ ack, body, view, client, context, logger }) => {
   const userId = body.user.id;
   const v = view.state.values;
   const form = {
@@ -223,6 +306,8 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
     supportPlan: v.support_plan?.value?.selected_option?.value || '',
     urgency: v.urgency.value.selected_option.value, // high | normal | low
     description: v.description.value.value,
+    // 사진/파일 첨부 (file_input) — 다운로드에 필요한 정보만 추림
+    files: parseAttachments(v.attachments?.files),
   };
 
   // 요청자 이메일 형식 검증 → 모달에 인라인 에러 표시 (ack 전에 처리)
@@ -241,7 +326,17 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
         `회사: ${form.company} | 양식: ${form.formType}`
     );
 
-    const ticket = await createZendeskTicket(form);
+    // 첨부파일: Slack에서 다운로드 → Zendesk 업로드 → 업로드 토큰 확보
+    let uploadToken = null;
+    if (form.files.length) {
+      try {
+        uploadToken = await uploadFilesToZendesk(form.files, context.botToken);
+      } catch (e) {
+        logger.error('첨부파일 업로드 실패(첨부 없이 티켓 생성 진행):', e);
+      }
+    }
+
+    const ticket = await createZendeskTicket(form, uploadToken);
 
     // 양방향 동기화: 티켓 ID ↔ Slack 사용자 매핑 저장 (웹훅 수신 시 회신 대상)
     if (ticket) {
@@ -261,23 +356,27 @@ app.view('ticket_modal', async ({ ack, body, view, client, logger }) => {
       ? `티켓 *#${ticket.id}* 이(가) 생성되었습니다.`
       : '(개발 모드) Zendesk 미연동 상태라 티켓은 생성되지 않았습니다.';
 
+    const confirmBlocks = [
+      { type: 'section', text: { type: 'mrkdwn', text: `✅ *문의가 접수되었습니다.*\n${idText}` } },
+      {
+        type: 'section',
+        fields: [
+          { type: 'mrkdwn', text: `*양식:*\n${form.formType}${form.techArea ? ` (${form.techArea})` : ''}` },
+          { type: 'mrkdwn', text: `*회사:*\n${form.company}` },
+          { type: 'mrkdwn', text: `*요청자:*\n${form.requesterEmail}` },
+          { type: 'mrkdwn', text: `*긴급도:*\n${URGENCY_LABEL[form.urgency] ?? form.urgency}` },
+          { type: 'mrkdwn', text: `*AWS 계정 ID:*\n${form.awsAccount || '-'}` },
+          { type: 'mrkdwn', text: `*서포트 플랜:*\n${form.supportPlan || '-'}` },
+        ],
+      },
+    ];
+    // 티켓이 실제 생성된 경우, 새 티켓 없이 같은 티켓에 이어서 답장할 수 있는 버튼 제공
+    if (ticket) confirmBlocks.push(replyButton(ticket.id));
+
     await client.chat.postMessage({
       channel: userId,
       text: `✅ 문의가 접수되었습니다. ${idText}`,
-      blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: `✅ *문의가 접수되었습니다.*\n${idText}` } },
-        {
-          type: 'section',
-          fields: [
-            { type: 'mrkdwn', text: `*양식:*\n${form.formType}${form.techArea ? ` (${form.techArea})` : ''}` },
-            { type: 'mrkdwn', text: `*회사:*\n${form.company}` },
-            { type: 'mrkdwn', text: `*요청자:*\n${form.requesterEmail}` },
-            { type: 'mrkdwn', text: `*긴급도:*\n${URGENCY_LABEL[form.urgency] ?? form.urgency}` },
-            { type: 'mrkdwn', text: `*AWS 계정 ID:*\n${form.awsAccount || '-'}` },
-            { type: 'mrkdwn', text: `*서포트 플랜:*\n${form.supportPlan || '-'}` },
-          ],
-        },
-      ],
+      blocks: confirmBlocks,
     });
   } catch (error) {
     logger.error('티켓 생성 실패:', error);
@@ -316,7 +415,7 @@ async function resolveRequesterEmail(client, userId) {
 }
 
 // ── 헬퍼: Zendesk 티켓 생성 ─────────────────────────────────
-async function createZendeskTicket(form) {
+async function createZendeskTicket(form, uploadToken) {
   // 제목: 고객이 입력한 제목을 사용하되, 팀 트리아지용으로 [회사명] 접두어를 붙인다.
   const subject = `[${form.company}] ${form.subject}`;
 
@@ -349,7 +448,7 @@ async function createZendeskTicket(form) {
   const payload = {
     ticket: {
       subject,
-      comment: { body: bodyText },
+      comment: { body: bodyText, ...(uploadToken ? { uploads: [uploadToken] } : {}) },
       priority: form.urgency, // high | normal | low
       tags,
       // 요청자 = 이메일 기준. 기존 사용자면 매칭(이름 자동), 없으면 이메일로 신규 생성.
@@ -375,6 +474,112 @@ async function createZendeskTicket(form) {
 // ── 헬퍼: Zendesk Basic 인증 헤더 값 ────────────────────────
 function zendeskAuth() {
   return Buffer.from(`${ZENDESK_EMAIL}/token:${ZENDESK_API_TOKEN}`).toString('base64');
+}
+
+// ── 헬퍼: "이 티켓에 답장" 버튼 블록 ────────────────────────
+function replyButton(ticketId) {
+  return {
+    type: 'actions',
+    elements: [
+      {
+        type: 'button',
+        action_id: 'reply_ticket',
+        text: { type: 'plain_text', text: '💬 이 티켓에 답장' },
+        value: String(ticketId),
+      },
+    ],
+  };
+}
+
+// ── 헬퍼: 첨부파일 Slack 다운로드 → Zendesk 업로드 → 토큰 반환 ──
+// 여러 파일을 같은 업로드 토큰에 이어붙여 하나의 토큰으로 반환한다.
+async function uploadFilesToZendesk(files, botToken) {
+  if (!files?.length || !zendeskEnabled) return null;
+  let token;
+  for (const f of files) {
+    if (!f.url) continue;
+    // 1) Slack에서 파일 다운로드 (봇 토큰 필요, files:read 스코프)
+    const dl = await fetch(f.url, { headers: { Authorization: `Bearer ${botToken}` } });
+    if (!dl.ok) throw new Error(`Slack 파일 다운로드 실패 ${dl.status}`);
+    const buf = Buffer.from(await dl.arrayBuffer());
+    // 2) Zendesk 업로드 (token 파라미터로 여러 파일을 하나로 묶음)
+    const q = new URLSearchParams({ filename: f.name || 'attachment' });
+    if (token) q.set('token', token);
+    const up = await fetch(
+      `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/uploads.json?${q.toString()}`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${zendeskAuth()}`,
+          'Content-Type': f.mimetype || 'application/octet-stream',
+        },
+        body: buf,
+      }
+    );
+    if (!up.ok) throw new Error(`Zendesk 업로드 실패 ${up.status}: ${await up.text()}`);
+    const data = await up.json();
+    token = data.upload?.token;
+  }
+  return token || null;
+}
+
+// ── 헬퍼: 티켓의 최근 공개 코멘트(텍스트+첨부) 조회 (담당자→고객) ──
+async function fetchLatestPublicComment(ticketId) {
+  if (!zendeskEnabled) return null;
+  const res = await fetch(
+    `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}/comments.json`,
+    { headers: { Authorization: `Basic ${zendeskAuth()}` } }
+  );
+  if (!res.ok) throw new Error(`Zendesk comments ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  const publicComments = (data.comments || []).filter((c) => c.public);
+  return publicComments[publicComments.length - 1] || null; // { body, attachments, ... }
+}
+
+// ── 헬퍼: Zendesk 첨부 → 고객 Slack DM에 이미지 업로드 (files:write 필요) ──
+async function uploadZendeskAttachmentsToSlack(web, channelId, attachments) {
+  for (const att of attachments) {
+    try {
+      const dl = await fetch(att.content_url, { headers: { Authorization: `Basic ${zendeskAuth()}` } });
+      if (!dl.ok) {
+        console.error(`Zendesk 첨부 다운로드 실패 ${dl.status}: ${att.file_name}`);
+        continue;
+      }
+      const buf = Buffer.from(await dl.arrayBuffer());
+      await web.files.uploadV2({
+        channel_id: channelId,
+        file: buf,
+        filename: att.file_name || 'attachment',
+      });
+    } catch (e) {
+      console.error(`첨부 Slack 업로드 실패: ${att.file_name}`, e);
+    }
+  }
+}
+
+// ── 헬퍼: 기존 티켓에 공개 코멘트 추가 (고객 답장) ───────────
+// 새 티켓을 만들지 않고 동일 티켓에 대화를 이어붙인다.
+async function addZendeskComment(ticketId, text, slackUserId, uploadToken) {
+  if (!zendeskEnabled) {
+    console.log('[DEV] Zendesk 미연동 — 코멘트 생략:', { ticketId, text });
+    return;
+  }
+  const body = `💬 [Slack 고객 답장]\n\n${text}\n\n— (Slack user: ${slackUserId})`;
+  const payload = {
+    ticket: { comment: { body, public: true, ...(uploadToken ? { uploads: [uploadToken] } : {}) } },
+  };
+  const res = await fetch(
+    `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}.json`,
+    {
+      method: 'PUT',
+      headers: { Authorization: `Basic ${zendeskAuth()}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }
+  );
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Zendesk comment ${res.status}: ${t}`);
+  }
 }
 
 // ── 헬퍼: 요청자 이메일로 티켓 목록 조회 (기능 B) ───────────
@@ -403,6 +608,13 @@ function buildStatusBlocks(tickets, email) {
       text: {
         type: 'mrkdwn',
         text: `*#${t.id}* · ${status}\n${t.subject || '(제목 없음)'}\n_생성일: ${created}_`,
+      },
+      // 목록에서 바로 이어쓰기 (reply_ticket 액션 재사용)
+      accessory: {
+        type: 'button',
+        action_id: 'reply_ticket',
+        text: { type: 'plain_text', text: '💬 답장' },
+        value: String(t.id),
       },
     });
   }
@@ -481,6 +693,32 @@ function textInput(block_id, label, { optional = false, multiline = false, place
   return block;
 }
 
+// ── 헬퍼: 파일 첨부(file_input) 블록 ────────────────────────
+function fileInputBlock(block_id, label) {
+  return {
+    type: 'input',
+    block_id,
+    optional: true,
+    label: { type: 'plain_text', text: label },
+    element: {
+      type: 'file_input',
+      action_id: 'files',
+      // Slack이 인식하는 filetype 슬러그만 사용 (jpg가 jpeg 포함)
+      filetypes: ['png', 'jpg', 'gif', 'pdf'],
+      max_files: 5,
+    },
+  };
+}
+
+// ── 헬퍼: 첨부 파일 상태값 → 다운로드용 최소 정보 배열 ───────
+function parseAttachments(fileState) {
+  return (fileState?.files || []).map((f) => ({
+    url: f.url_private_download || f.url_private,
+    name: f.name,
+    mimetype: f.mimetype,
+  }));
+}
+
 // ── 문의 모달 정의 (스마일샤크 Zendesk 양식 기준) ───────────
 function buildTicketModal() {
   return {
@@ -519,6 +757,7 @@ function buildTicketModal() {
       }),
       textInput('subject', '제목', { max: 150, placeholder: '문의 제목을 입력하세요' }),
       textInput('description', '문의 내용', { multiline: true, max: 3000, placeholder: '문의 상세 내용을 입력하세요' }),
+      fileInputBlock('attachments', '사진/파일 첨부'),
     ],
   };
 }
