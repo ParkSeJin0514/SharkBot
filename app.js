@@ -10,6 +10,10 @@ import {
   storeMode,
   storeTicketMapping,
   fetchTicketMapping,
+  storeCompanyTeam,
+  fetchCompanyTeam,
+  storeUserByEmail,
+  fetchUserByEmail,
 } from './installationStore.js';
 
 const { App, ExpressReceiver } = bolt;
@@ -41,6 +45,47 @@ const STATUS_LABEL = {
   solved: '✅ 해결됨',
   closed: '📁 종료',
 };
+
+// 고객사 디렉터리 (샘플) — 회사 선택 시 소속 직원(요청자) 드롭다운을 채운다.
+// TODO: 실서비스에선 Zendesk organizations/users API 또는 별도 설정에서 로드.
+const COMPANY_DIRECTORY = {
+  '스마일민정': [
+    { name: '김민정', email: 'sj.park+kmj@smileshark.kr' },
+    { name: '박세진', email: 'bjtanker0514+psj@gmail.com' },
+  ],
+  '스마일정빈': [
+    { name: '장정빈', email: 'sj.park+jjb@smileshark.kr' },
+    { name: '김기수', email: 'bjtanker0514+kgs@gmail.com' },
+  ],
+  '스마일수현': [
+    { name: '김수현', email: 'sj.park+ksh@smileshark.kr' },
+    { name: '강호성', email: 'bjtanker0514+ghs@gmail.com' },
+  ],
+};
+
+// Zendesk 커스텀 필드 ID
+const ZD_FIELD = {
+  form: 60399135006617,       // 양식 (드롭다운)
+  techArea: 60399171700889,  // 기술 분야 (드롭다운)
+  company: 60399237780249,   // 회사명 (드롭다운)
+  supportPlan: 60399187106201, // AWS 서포트 플랜 (드롭다운)
+  customerEmail: 60399189427993, // 고객사 이메일 (텍스트)
+  awsAccount: 60399202141337, // AWS Account ID (텍스트)
+};
+
+// 드롭다운 한글 표시명 → Zendesk 옵션 태그
+const FORM_TAG = {
+  '기술문의': 'form_tech', '비용문의': 'form_cost', '샤크몬 문의': 'form_sharkmon',
+  '내부문서요청': 'form_doc', '인시던트': 'form_incident', '미팅협의': 'form_meeting',
+};
+const AREA_TAG = { AWS: 'area_aws', Datadog: 'area_datadog', NHN: 'area_nhn' };
+const PLAN_TAG = {
+  Basic: 'plan_basic', Developer: 'plan_developer', Business: 'plan_business',
+  'Enterprise On-Ramp': 'plan_onramp', Enterprise: 'plan_enterprise',
+};
+const COMPANY_TAG = { '스마일민정': 'co_minjeong', '스마일정빈': 'co_jeongbin', '스마일수현': 'co_suhyeon' };
+// 태그 → 회사 표시명 (역방향, 라우팅 로그용)
+const TAG_COMPANY = Object.fromEntries(Object.entries(COMPANY_TAG).map(([k, v]) => [v, k]));
 
 // ── 실행 환경 / Bedrock ─────────────────────────────────────
 const isLambda = Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
@@ -94,8 +139,21 @@ receiver.app.post('/zendesk/webhook', express.json(), async (req, res) => {
   }
 
   try {
-    const map = await fetchTicketMapping(ticket_id);
-    if (!map) return res.status(200).send('no mapping'); // 봇 외 경로로 생성된 티켓
+    let map = await fetchTicketMapping(ticket_id);
+    // 봇 매핑이 없으면(상담사가 Zendesk에서 직접 만든 티켓) 커스텀 필드로 라우팅 시도.
+    if (!map) {
+      try {
+        const routed = await routeAgentTicket(ticket_id);
+        if (routed) {
+          map = routed;
+          // 다음 답변부터는 빠르게 회신하도록 매핑을 캐시.
+          await storeTicketMapping(ticket_id, routed);
+        }
+      } catch (e) {
+        console.error('상담사-먼저 티켓 라우팅 실패:', e);
+      }
+    }
+    if (!map) return res.status(200).send('no mapping'); // 라우팅 대상 미상
 
     const installation = await installationStore.fetchInstallation({
       teamId: map.teamId,
@@ -109,31 +167,55 @@ receiver.app.post('/zendesk/webhook', express.json(), async (req, res) => {
     // 텍스트 + 첨부(content_url)를 확보한다. (실패 시 페이로드 텍스트로 폴백)
     let commentText = comment;
     let attachments = [];
+    let commentAuthorId = null;
     try {
       const latest = await fetchLatestPublicComment(ticket_id);
       if (latest) {
         commentText = latest.body || comment;
         attachments = latest.attachments || [];
+        commentAuthorId = latest.author_id;
       }
     } catch (e) {
       console.error('최근 코멘트 조회 실패(페이로드 텍스트로 대체):', e);
     }
 
-    const web = new WebClient(botToken);
-    // 첨부 업로드(files.uploadV2)에는 DM 채널 ID가 필요 → IM 채널 오픈
-    const im = await web.conversations.open({ users: map.userId });
-    const channelId = im.channel?.id || map.userId;
+    // 요청자(고객) 본인 명의로 달린 코멘트면 → 고객 답장이므로 되돌려보내지 않음 (echo 방지)
+    try {
+      const requesterId = await fetchTicketRequesterId(ticket_id);
+      if (requesterId && commentAuthorId && requesterId === commentAuthorId) {
+        return res.status(200).send('skipped (requester comment)');
+      }
+    } catch (e) {
+      console.error('요청자 조회 실패(echo 방지 판단 불가):', e);
+    }
 
-    await web.chat.postMessage({
+    const web = new WebClient(botToken);
+    // 게시 대상: 고객사 지원 채널(map.channelId) 우선. 없으면(구 매핑) 요청자 DM으로 폴백.
+    let channelId = map.channelId;
+    if (!channelId) {
+      const im = await web.conversations.open({ users: map.userId });
+      channelId = im.channel?.id || map.userId;
+    }
+    // 이 티켓의 스레드가 이미 있으면 그 스레드에 이어붙이고, 없으면 이번 메시지를 스레드 루트로.
+    let threadTs = map.threadTs || undefined;
+    // 슬랙에 이 티켓 스레드가 아직 없다 = 상담사가 Zendesk에서 새로 만든 티켓(첫 등장)
+    const isNewTicket = !threadTs;
+
+    const headerText = isNewTicket
+      ? `📩 *스마일샤크 담당자가 새 티켓을 보냈어요. (#${ticket_id})*` + (subject ? `\n_${subject}_` : '')
+      : `💬 *티켓 #${ticket_id} 에 담당자 답변이 등록되었어요.*` + (subject ? `\n_${subject}_` : '');
+    const notifyText = isNewTicket
+      ? `📩 새 티켓이 도착했습니다. (#${ticket_id})`
+      : `💬 티켓 #${ticket_id} 에 담당자 답변이 등록되었습니다.`;
+
+    const posted = await web.chat.postMessage({
       channel: channelId,
-      text: `💬 티켓 #${ticket_id} 에 담당자 답변이 등록되었습니다.`,
+      thread_ts: threadTs,
+      text: notifyText,
       blocks: [
         {
           type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `💬 *티켓 #${ticket_id} 에 담당자 답변이 등록되었어요.*` + (subject ? `\n_${subject}_` : ''),
-          },
+          text: { type: 'mrkdwn', text: headerText },
         },
         { type: 'section', text: { type: 'mrkdwn', text: commentText ? truncate(commentText, 2800) : '(내용 없음)' } },
         replyButton(ticket_id),
@@ -146,9 +228,27 @@ receiver.app.post('/zendesk/webhook', express.json(), async (req, res) => {
       ],
     });
 
-    // 담당자 첨부(사진 등)를 고객 Slack DM에 이미지로 업로드 (files:write 필요)
+    // 스레드가 없던 티켓(상담사-먼저 첫 답변 등)이면 방금 만든 메시지를 스레드 루트로 저장.
+    if (!threadTs && posted?.ts) {
+      threadTs = posted.ts;
+      try {
+        await storeTicketMapping(ticket_id, {
+          teamId: map.teamId,
+          enterpriseId: map.enterpriseId,
+          isEnterpriseInstall: map.isEnterpriseInstall,
+          userId: map.userId,
+          channelId,
+          threadTs,
+        });
+      } catch (e) {
+        console.error('스레드 루트 저장 실패:', e);
+      }
+    }
+
+    // 담당자 첨부(사진 등)를 같은 채널·스레드에 이미지로 업로드 (files:write + 채널 멤버 필요)
     if (attachments.length) {
-      await uploadZendeskAttachmentsToSlack(web, channelId, attachments);
+      await ensureBotInChannel(web, channelId);
+      await uploadZendeskAttachmentsToSlack(web, channelId, attachments, threadTs);
     }
     return res.status(200).send('ok');
   } catch (e) {
@@ -164,10 +264,27 @@ app.command('/zendesk', async ({ ack, body, client, logger }) => {
   try {
     await client.views.open({
       trigger_id: body.trigger_id,
-      view: buildTicketModal(),
+      view: buildTicketModal({ channelId: body.channel_id }),
     });
   } catch (error) {
     logger.error('모달 열기 실패:', error);
+  }
+});
+
+// ── 1-0. 회사 선택 변경 → 그 회사 직원(요청자) 드롭다운 갱신 ──
+app.action('company_action', async ({ ack, body, client, logger }) => {
+  await ack();
+  const selected = body.actions?.[0]?.selected_option?.value;
+  let channelId = '';
+  try { channelId = JSON.parse(body.view.private_metadata || '{}').channelId || ''; } catch { /* noop */ }
+  try {
+    await client.views.update({
+      view_id: body.view.id,
+      hash: body.view.hash,
+      view: buildTicketModal({ company: selected, channelId }),
+    });
+  } catch (error) {
+    logger.error('회사 선택 모달 갱신 실패:', error);
   }
 });
 
@@ -200,33 +317,33 @@ app.action('reply_ticket', async ({ ack, body, client, logger }) => {
   }
 });
 
-// ── 1-1b. 답장 모달 제출 → 기존 티켓에 공개 코멘트 추가 ──────
-app.view('reply_modal', async ({ ack, body, view, client, context, logger }) => {
-  await ack();
-  const userId = body.user.id;
-  const ticketId = view.private_metadata;
-  const text = view.state.values.reply_text.value.value;
-  const files = parseAttachments(view.state.values.reply_attachments?.files);
+// ── 1-1b. 답장 모달 제출 → 즉시 ack, 실제 처리는 비동기 워커로 (3초 제약 회피) ──
+app.view('reply_modal', async ({ ack, body, view, logger }) => {
+  await ack(); // 모달 즉시 닫기 (Slack 3초 제약)
+  const payload = {
+    __replyWorker: true,
+    ticketId: view.private_metadata,
+    text: view.state.values.reply_text.value.value,
+    files: parseAttachments(view.state.values.reply_attachments?.files),
+    userId: body.user.id,
+    teamId: body.team?.id,
+    enterpriseId: body.enterprise?.id,
+    isEnterpriseInstall: Boolean(body.is_enterprise_install),
+  };
   try {
-    let uploadToken = null;
-    if (files.length) {
-      try {
-        uploadToken = await uploadFilesToZendesk(files, context.botToken);
-      } catch (e) {
-        logger.error('답장 첨부 업로드 실패(첨부 없이 코멘트 진행):', e);
-      }
+    if (isLambda) {
+      await lambdaClient.send(
+        new InvokeCommand({
+          FunctionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
+          InvocationType: 'Event', // 비동기
+          Payload: Buffer.from(JSON.stringify(payload)),
+        })
+      );
+    } else {
+      await handleReplyWorker(payload);
     }
-    await addZendeskComment(ticketId, text, userId, uploadToken);
-    await client.chat.postMessage({
-      channel: userId,
-      text: `✅ 티켓 *#${ticketId}* 에 답장을 전달했어요.`,
-    });
-  } catch (error) {
-    logger.error('답장 코멘트 추가 실패:', error);
-    await client.chat.postMessage({
-      channel: userId,
-      text: `⚠️ 티켓 #${ticketId} 답장 전송 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.`,
-    });
+  } catch (e) {
+    logger.error('답장 워커 호출 실패:', e);
   }
 });
 
@@ -294,12 +411,22 @@ app.command('/zendesk-status', async ({ ack, command, client, respond, logger })
 //       분리하는 것을 권장. (DEPLOYMENT.md 참고)
 app.view('ticket_modal', async ({ ack, body, view, client, context, logger }) => {
   const userId = body.user.id;
+  // /zendesk가 실행된 채널 = 이 고객사의 지원 채널 (담당자 답변·답장 라우팅 대상)
+  let originChannel = '';
+  try { originChannel = JSON.parse(view.private_metadata || '{}').channelId || ''; } catch { /* noop */ }
   const v = view.state.values;
+  const company = v.company?.company_action?.selected_option?.value || '';
+  const requesterEmail = v.requester?.value?.selected_option?.value || '';
+  // 요청자 이름: 디렉터리에서 조회 (없으면 이메일 앞부분으로 폴백)
+  const member = (COMPANY_DIRECTORY[company] || []).find((m) => m.email === requesterEmail);
+  const requesterName = member?.name || (requesterEmail ? requesterEmail.split('@')[0] : '');
+
   const form = {
     formType: v.form_type.value.selected_option.value,
     techArea: v.tech_area?.value?.selected_option?.value || '',
-    requesterEmail: (v.requester_email.value.value || '').trim(),
-    company: v.company.value.value,
+    company,
+    requesterEmail,
+    requesterName,
     subject: v.subject.value.value,
     ccEmails: parseEmails(v.cc?.value?.value || ''),
     awsAccount: v.aws_account?.value?.value || '',
@@ -310,80 +437,40 @@ app.view('ticket_modal', async ({ ack, body, view, client, context, logger }) =>
     files: parseAttachments(v.attachments?.files),
   };
 
-  // 요청자 이메일 형식 검증 → 모달에 인라인 에러 표시 (ack 전에 처리)
-  if (!isEmail(form.requesterEmail)) {
+  // 회사·요청자 미선택 방지 (드롭다운 필수지만 안전장치)
+  if (!company || !requesterEmail) {
     await ack({
       response_action: 'errors',
-      errors: { requester_email: '올바른 이메일 형식을 입력해 주세요. (예: user@company.com)' },
+      errors: { company: '회사와 요청자를 모두 선택해 주세요.' },
     });
     return;
   }
-  await ack();
+  await ack(); // 모달 즉시 닫기 (Slack 3초 제약)
 
+  // 첨부 업로드·Zendesk 생성·채널 게시는 느릴 수 있으므로 비동기 워커로 넘긴다.
+  const payload = {
+    __ticketWorker: true,
+    form,
+    userId,
+    originChannel,
+    teamId: body.team?.id,
+    enterpriseId: body.enterprise?.id,
+    isEnterpriseInstall: Boolean(body.is_enterprise_install),
+  };
   try {
-    logger.info(
-      `📨 문의 접수 | Slack ID: ${userId} | 요청자: ${form.requesterEmail} | ` +
-        `회사: ${form.company} | 양식: ${form.formType}`
-    );
-
-    // 첨부파일: Slack에서 다운로드 → Zendesk 업로드 → 업로드 토큰 확보
-    let uploadToken = null;
-    if (form.files.length) {
-      try {
-        uploadToken = await uploadFilesToZendesk(form.files, context.botToken);
-      } catch (e) {
-        logger.error('첨부파일 업로드 실패(첨부 없이 티켓 생성 진행):', e);
-      }
+    if (isLambda) {
+      await lambdaClient.send(
+        new InvokeCommand({
+          FunctionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
+          InvocationType: 'Event', // 비동기
+          Payload: Buffer.from(JSON.stringify(payload)),
+        })
+      );
+    } else {
+      await handleTicketWorker(payload);
     }
-
-    const ticket = await createZendeskTicket(form, uploadToken);
-
-    // 양방향 동기화: 티켓 ID ↔ Slack 사용자 매핑 저장 (웹훅 수신 시 회신 대상)
-    if (ticket) {
-      try {
-        await storeTicketMapping(ticket.id, {
-          teamId: body.team?.id,
-          enterpriseId: body.enterprise?.id,
-          isEnterpriseInstall: Boolean(body.is_enterprise_install),
-          userId,
-        });
-      } catch (e) {
-        logger.error('티켓 매핑 저장 실패(회신 동기화 불가):', e);
-      }
-    }
-
-    const idText = ticket
-      ? `티켓 *#${ticket.id}* 이(가) 생성되었습니다.`
-      : '(개발 모드) Zendesk 미연동 상태라 티켓은 생성되지 않았습니다.';
-
-    const confirmBlocks = [
-      { type: 'section', text: { type: 'mrkdwn', text: `✅ *문의가 접수되었습니다.*\n${idText}` } },
-      {
-        type: 'section',
-        fields: [
-          { type: 'mrkdwn', text: `*양식:*\n${form.formType}${form.techArea ? ` (${form.techArea})` : ''}` },
-          { type: 'mrkdwn', text: `*회사:*\n${form.company}` },
-          { type: 'mrkdwn', text: `*요청자:*\n${form.requesterEmail}` },
-          { type: 'mrkdwn', text: `*긴급도:*\n${URGENCY_LABEL[form.urgency] ?? form.urgency}` },
-          { type: 'mrkdwn', text: `*AWS 계정 ID:*\n${form.awsAccount || '-'}` },
-          { type: 'mrkdwn', text: `*서포트 플랜:*\n${form.supportPlan || '-'}` },
-        ],
-      },
-    ];
-    // 티켓이 실제 생성된 경우, 새 티켓 없이 같은 티켓에 이어서 답장할 수 있는 버튼 제공
-    if (ticket) confirmBlocks.push(replyButton(ticket.id));
-
-    await client.chat.postMessage({
-      channel: userId,
-      text: `✅ 문의가 접수되었습니다. ${idText}`,
-      blocks: confirmBlocks,
-    });
-  } catch (error) {
-    logger.error('티켓 생성 실패:', error);
-    await client.chat.postMessage({
-      channel: userId,
-      text: '⚠️ 문의 접수 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
-    });
+  } catch (e) {
+    logger.error('티켓 워커 호출 실패:', e);
   }
 });
 
@@ -419,40 +506,36 @@ async function createZendeskTicket(form, uploadToken) {
   // 제목: 고객이 입력한 제목을 사용하되, 팀 트리아지용으로 [회사명] 접두어를 붙인다.
   const subject = `[${form.company}] ${form.subject}`;
 
-  const bodyText = [
-    form.description,
-    '',
-    '────────────',
-    `양식: ${form.formType}`,
-    `기술 분야: ${form.techArea || '-'}`,
-    `요청자 이메일: ${form.requesterEmail}`,
-    `회사명: ${form.company}`,
-    `AWS 계정 ID: ${form.awsAccount || '-'}`,
-    `AWS 서포트 플랜: ${form.supportPlan || '-'}`,
-    `긴급도: ${URGENCY_LABEL[form.urgency] ?? form.urgency}`,
-    `참조(CC): ${form.ccEmails?.length ? form.ccEmails.join(', ') : '-'}`,
-    '(Sharkton 봇에서 자동 생성)',
-  ].join('\n');
+  // 티켓 본문 = 고객 문의 내용만 (양식·계정 등 메타데이터는 본문에 넣지 않음)
+  const publicBody = form.description;
 
   if (!zendeskEnabled) {
     console.log('[DEV] Zendesk 미연동 — 티켓 생성 생략:', { subject });
     return null;
   }
 
-  // TODO: Zendesk 커스텀 필드(양식·계정ID 등)의 field ID를 확보하면
-  //       custom_fields: [{ id, value }] 로 정식 매핑 예정. 현재는 본문+태그로 처리.
-  const tags = ['sharkton', form.formType, form.techArea]
-    .filter(Boolean)
-    .map((t) => t.replace(/\s+/g, '_'));
+  // 폼 값을 Zendesk 커스텀 필드로 정식 매핑 (드롭다운은 태그, 텍스트는 값 그대로)
+  const custom_fields = [
+    { id: ZD_FIELD.form, value: FORM_TAG[form.formType] },
+    { id: ZD_FIELD.techArea, value: AREA_TAG[form.techArea] },
+    { id: ZD_FIELD.company, value: COMPANY_TAG[form.company] },
+    { id: ZD_FIELD.supportPlan, value: PLAN_TAG[form.supportPlan] },
+    { id: ZD_FIELD.customerEmail, value: form.requesterEmail },
+    { id: ZD_FIELD.awsAccount, value: form.awsAccount },
+  ].filter((f) => f.value); // 빈 값 제외 (드롭다운 옵션 태그는 티켓 태그로도 자동 반영됨)
 
   const payload = {
     ticket: {
       subject,
-      comment: { body: bodyText, ...(uploadToken ? { uploads: [uploadToken] } : {}) },
+      comment: { body: publicBody, public: true, ...(uploadToken ? { uploads: [uploadToken] } : {}) },
       priority: form.urgency, // high | normal | low
-      tags,
-      // 요청자 = 이메일 기준. 기존 사용자면 매칭(이름 자동), 없으면 이메일로 신규 생성.
-      ...(form.requesterEmail ? { requester: { email: form.requesterEmail } } : {}),
+      tags: ['sharkton'],
+      custom_fields,
+      // 요청자 = 이메일 기준. 기존 사용자면 매칭(이 name은 무시·실제 이름 유지),
+      // 신규 사용자면 Zendesk가 이름을 요구하므로 디렉터리의 이름(폴백: 이메일 앞부분)을 사용.
+      ...(form.requesterEmail
+        ? { requester: { email: form.requesterEmail, name: form.requesterName || form.requesterEmail.split('@')[0] || form.requesterEmail } }
+        : {}),
       ...(form.ccEmails?.length ? { collaborators: form.ccEmails } : {}),
     },
   };
@@ -523,6 +606,102 @@ async function uploadFilesToZendesk(files, botToken) {
   return token || null;
 }
 
+// ── 헬퍼: 티켓 요청자(고객) 사용자 ID 조회 ─────────────────
+async function fetchTicketRequesterId(ticketId) {
+  if (!zendeskEnabled) return null;
+  const res = await fetch(
+    `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}.json`,
+    { headers: { Authorization: `Basic ${zendeskAuth()}` } }
+  );
+  if (!res.ok) throw new Error(`Zendesk ticket ${res.status}`);
+  const data = await res.json();
+  return data.ticket?.requester_id || null;
+}
+
+// ── 헬퍼: 티켓 상세(커스텀 필드·요청자) 조회 ─────────────────
+async function fetchTicketDetail(ticketId) {
+  if (!zendeskEnabled) return null;
+  const res = await fetch(
+    `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}.json`,
+    { headers: { Authorization: `Basic ${zendeskAuth()}` } }
+  );
+  if (!res.ok) throw new Error(`Zendesk ticket ${res.status}`);
+  const data = await res.json();
+  return data.ticket || null;
+}
+
+// ── 헬퍼: Zendesk 사용자 이메일 조회 ─────────────────────────
+async function fetchZendeskUserEmail(userId) {
+  if (!zendeskEnabled || !userId) return null;
+  const res = await fetch(
+    `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/users/${userId}.json`,
+    { headers: { Authorization: `Basic ${zendeskAuth()}` } }
+  );
+  if (!res.ok) throw new Error(`Zendesk user ${res.status}`);
+  const data = await res.json();
+  return data.user?.email || null;
+}
+
+// ── 헬퍼: 이메일로 Zendesk 사용자 ID 조회 (답장 명의 매칭용) ──
+async function findZendeskUserByEmail(email) {
+  if (!zendeskEnabled || !email) return null;
+  const res = await fetch(
+    `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/users/search.json?query=${encodeURIComponent(email)}`,
+    { headers: { Authorization: `Basic ${zendeskAuth()}` } }
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  const u = (data.users || []).find((x) => (x.email || '').toLowerCase() === email.toLowerCase());
+  return u?.id || null;
+}
+
+// ── 헬퍼: 상담사-먼저 티켓 → Slack 라우팅 대상 해석 ──────────
+// 봇 매핑이 없는(상담사가 Zendesk에서 직접 만든) 티켓을 커스텀 필드로 라우팅한다.
+//   1순위(MSP 표준): 회사 태그 → 그 고객사 지원 채널 (개인 매칭 불필요)
+//   2순위(폴백): 고객사/요청자 이메일 → 이메일 매핑(과거 /zendesk 기록)으로 개인 DM
+// 반환: { teamId, enterpriseId, isEnterpriseInstall, channelId?, userId? } | null
+async function routeAgentTicket(ticketId) {
+  if (!zendeskEnabled) return null;
+  const ticket = await fetchTicketDetail(ticketId);
+  if (!ticket) return null;
+
+  const fields = ticket.custom_fields || [];
+  const fieldValue = (id) => fields.find((f) => Number(f.id) === Number(id))?.value || null;
+  const companyTag = fieldValue(ZD_FIELD.company);
+
+  // 1순위: 회사 → 지원 채널
+  if (companyTag) {
+    const reg = await fetchCompanyTeam(companyTag);
+    if (reg?.teamId && reg?.channelId) {
+      return {
+        teamId: reg.teamId,
+        enterpriseId: reg.enterpriseId,
+        isEnterpriseInstall: reg.isEnterpriseInstall,
+        channelId: reg.channelId,
+      };
+    }
+  }
+
+  // 2순위: 이메일 → 개인 DM (지원 채널이 없는 고객사 대비)
+  let email = fieldValue(ZD_FIELD.customerEmail);
+  if (!email && ticket.requester_id) {
+    try { email = await fetchZendeskUserEmail(ticket.requester_id); } catch (e) { /* noop */ }
+  }
+  if (email) {
+    const byEmail = await fetchUserByEmail(email);
+    if (byEmail?.userId) {
+      return {
+        teamId: byEmail.teamId,
+        enterpriseId: byEmail.enterpriseId,
+        isEnterpriseInstall: byEmail.isEnterpriseInstall,
+        userId: byEmail.userId,
+      };
+    }
+  }
+
+  return null;
+}
+
 // ── 헬퍼: 티켓의 최근 공개 코멘트(텍스트+첨부) 조회 (담당자→고객) ──
 async function fetchLatestPublicComment(ticketId) {
   if (!zendeskEnabled) return null;
@@ -537,7 +716,7 @@ async function fetchLatestPublicComment(ticketId) {
 }
 
 // ── 헬퍼: Zendesk 첨부 → 고객 Slack DM에 이미지 업로드 (files:write 필요) ──
-async function uploadZendeskAttachmentsToSlack(web, channelId, attachments) {
+async function uploadZendeskAttachmentsToSlack(web, channelId, attachments, threadTs) {
   for (const att of attachments) {
     try {
       const dl = await fetch(att.content_url, { headers: { Authorization: `Basic ${zendeskAuth()}` } });
@@ -548,6 +727,7 @@ async function uploadZendeskAttachmentsToSlack(web, channelId, attachments) {
       const buf = Buffer.from(await dl.arrayBuffer());
       await web.files.uploadV2({
         channel_id: channelId,
+        thread_ts: threadTs,
         file: buf,
         filename: att.file_name || 'attachment',
       });
@@ -559,14 +739,33 @@ async function uploadZendeskAttachmentsToSlack(web, channelId, attachments) {
 
 // ── 헬퍼: 기존 티켓에 공개 코멘트 추가 (고객 답장) ───────────
 // 새 티켓을 만들지 않고 동일 티켓에 대화를 이어붙인다.
-async function addZendeskComment(ticketId, text, slackUserId, uploadToken) {
+async function addZendeskComment(ticketId, text, slackUserId, uploadToken, authorEmail) {
   if (!zendeskEnabled) {
     console.log('[DEV] Zendesk 미연동 — 코멘트 생략:', { ticketId, text });
     return;
   }
-  const body = `💬 [Slack 고객 답장]\n\n${text}\n\n— (Slack user: ${slackUserId})`;
+  // 명의: 채널에서 버튼 누른 사람(authorEmail) → Zendesk 유저 우선, 실패 시 티켓 요청자로 폴백.
+  // 요청자 명의면 마커 불필요 + 담당자→고객 웹훅 echo 자동 방지(end-user role).
+  let authorId = null;
+  if (authorEmail) {
+    try { authorId = await findZendeskUserByEmail(authorEmail); } catch (e) { /* noop */ }
+  }
+  if (!authorId) {
+    try {
+      authorId = await fetchTicketRequesterId(ticketId);
+    } catch (e) {
+      console.error('요청자 조회 실패(명의 지정 없이 진행):', e);
+    }
+  }
   const payload = {
-    ticket: { comment: { body, public: true, ...(uploadToken ? { uploads: [uploadToken] } : {}) } },
+    ticket: {
+      comment: {
+        body: text,
+        public: true,
+        ...(authorId ? { author_id: authorId } : {}),
+        ...(uploadToken ? { uploads: [uploadToken] } : {}),
+      },
+    },
   };
   const res = await fetch(
     `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}.json`,
@@ -640,6 +839,170 @@ async function askBedrock(question) {
   return res.output?.message?.content?.[0]?.text || '답변을 생성하지 못했습니다.';
 }
 
+// ── 헬퍼: 봇을 채널에 참여시킨다 (파일 업로드는 채널 멤버여야 가능) ──
+// 공개 채널은 자동 참여, DM/비공개(초대 필요)는 조용히 무시.
+async function ensureBotInChannel(web, channelId) {
+  if (!channelId || channelId[0] === 'D' || channelId[0] === 'U') return; // DM/사용자
+  try {
+    await web.conversations.join({ channel: channelId });
+  } catch (e) {
+    // already_in_channel 이면 정상, method_not_supported_for_channel_type/비공개면 초대 필요
+    const err = e?.data?.error;
+    if (err && err !== 'already_in_channel') {
+      console.error(`채널 자동 참여 실패(${channelId}): ${err} — 비공개 채널이면 봇 초대 필요`);
+    }
+  }
+}
+
+// ── 헬퍼: 비동기 워커 (티켓 생성 → 첨부 업로드 + Zendesk 생성 + 채널 스레드 게시 + 매핑) ──
+async function handleTicketWorker(event) {
+  const { form, userId, originChannel, teamId, enterpriseId, isEnterpriseInstall } = event;
+  let web = null;
+  try {
+    const installation = await installationStore.fetchInstallation({ teamId, enterpriseId, isEnterpriseInstall });
+    const botToken = installation?.bot?.token;
+    web = new WebClient(botToken);
+
+    console.log(
+      `📨 문의 접수 | Slack ID: ${userId} | 요청자: ${form.requesterEmail} | 회사: ${form.company} | 양식: ${form.formType}`
+    );
+
+    // 첨부파일: Slack에서 다운로드 → Zendesk 업로드 → 업로드 토큰 확보
+    let uploadToken = null;
+    if (form.files?.length) {
+      try {
+        uploadToken = await uploadFilesToZendesk(form.files, botToken);
+      } catch (e) {
+        console.error('첨부파일 업로드 실패(첨부 없이 티켓 생성 진행):', e);
+      }
+    }
+
+    const ticket = await createZendeskTicket(form, uploadToken);
+
+    const idText = ticket
+      ? `티켓 *#${ticket.id}* 이(가) 생성되었습니다.`
+      : '(개발 모드) Zendesk 미연동 상태라 티켓은 생성되지 않았습니다.';
+
+    const confirmBlocks = [
+      { type: 'section', text: { type: 'mrkdwn', text: `✅ *문의가 접수되었습니다.*\n${idText}` } },
+      {
+        type: 'section',
+        fields: [
+          { type: 'mrkdwn', text: `*양식:*\n${form.formType}${form.techArea ? ` (${form.techArea})` : ''}` },
+          { type: 'mrkdwn', text: `*회사:*\n${form.company}` },
+          { type: 'mrkdwn', text: `*요청자:*\n${form.requesterEmail}` },
+          { type: 'mrkdwn', text: `*긴급도:*\n${URGENCY_LABEL[form.urgency] ?? form.urgency}` },
+          { type: 'mrkdwn', text: `*AWS 계정 ID:*\n${form.awsAccount || '-'}` },
+          { type: 'mrkdwn', text: `*서포트 플랜:*\n${form.supportPlan || '-'}` },
+        ],
+      },
+    ];
+    if (ticket) confirmBlocks.push(replyButton(ticket.id));
+
+    // 접수 메시지를 지원 채널에 게시해 이 티켓의 "스레드 루트"로 삼는다.
+    // 파일 업로드가 뒤따를 수 있으므로 먼저 채널에 참여. 실패 시 요청자 DM으로 폴백.
+    let postChannel = originChannel || userId;
+    let threadTs = null;
+    await ensureBotInChannel(web, postChannel);
+    try {
+      const posted = await web.chat.postMessage({
+        channel: postChannel,
+        text: `✅ 문의가 접수되었습니다. ${idText}`,
+        blocks: confirmBlocks,
+      });
+      threadTs = posted.ts;
+    } catch (e) {
+      console.error('지원 채널 게시 실패(요청자 DM으로 폴백):', e?.data?.error || e);
+      postChannel = userId;
+      try {
+        const posted = await web.chat.postMessage({
+          channel: postChannel,
+          text: `✅ 문의가 접수되었습니다. ${idText}`,
+          blocks: confirmBlocks,
+        });
+        threadTs = posted.ts;
+      } catch (e2) {
+        console.error('DM 폴백 게시도 실패:', e2?.data?.error || e2);
+      }
+    }
+
+    // 양방향 동기화: 티켓 ↔ {채널·스레드·요청자} 매핑 저장 (웹훅/답장 회신 대상)
+    if (ticket) {
+      const meta = { teamId, enterpriseId, isEnterpriseInstall };
+      try {
+        await storeTicketMapping(ticket.id, { ...meta, userId, channelId: postChannel, threadTs });
+      } catch (e) {
+        console.error('티켓 매핑 저장 실패(회신 동기화 불가):', e);
+      }
+      // 회사 → 지원 채널 레지스트리 자동 채움 (상담사-먼저 티켓 라우팅용)
+      try {
+        const companyTag = COMPANY_TAG[form.company];
+        if (companyTag) await storeCompanyTeam(companyTag, { ...meta, channelId: originChannel });
+      } catch (e) {
+        console.error('회사→채널 매핑 저장 실패:', e);
+      }
+      // 이메일→사용자 매핑(개인 DM 폴백 라우팅용)
+      try {
+        if (form.requesterEmail) await storeUserByEmail(form.requesterEmail, { ...meta, userId });
+      } catch (e) {
+        console.error('이메일→사용자 매핑 저장 실패:', e);
+      }
+    }
+  } catch (e) {
+    console.error('티켓 생성 실패:', e);
+    try {
+      if (web) await web.chat.postMessage({ channel: userId, text: '⚠️ 문의 접수 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.' });
+    } catch { /* noop */ }
+  }
+  return { ok: true };
+}
+
+// ── 헬퍼: 비동기 워커 (답장 → 첨부 업로드 + 코멘트 등록 + 확인 DM) ──
+async function handleReplyWorker(event) {
+  const { ticketId, text, files, userId, teamId, enterpriseId, isEnterpriseInstall } = event;
+  let web = null;
+  // 이 티켓의 채널·스레드(있으면 그 스레드에 답장 반영, 없으면 DM 폴백)
+  let dest = userId;
+  let threadTs;
+  try {
+    const map = await fetchTicketMapping(ticketId);
+    if (map?.channelId) { dest = map.channelId; threadTs = map.threadTs || undefined; }
+  } catch (e) { /* noop: DM 폴백 */ }
+
+  try {
+    const installation = await installationStore.fetchInstallation({ teamId, enterpriseId, isEnterpriseInstall });
+    const botToken = installation?.bot?.token;
+    web = new WebClient(botToken);
+
+    let uploadToken = null;
+    if (files?.length) {
+      try {
+        uploadToken = await uploadFilesToZendesk(files, botToken);
+      } catch (e) {
+        console.error('답장 첨부 업로드 실패(첨부 없이 코멘트 진행):', e);
+      }
+    }
+    // 고객 답장은 항상 "티켓 요청자(고객) 명의"로 등록 → 방향(고객→담당자) 보장 + echo 방지.
+    await addZendeskComment(ticketId, text, userId, uploadToken);
+
+    // 채널 스레드에 답장 내용을 노출해 대화 로그를 일원화 (DM이면 스레드 없이 게시)
+    await web.chat.postMessage({
+      channel: dest,
+      thread_ts: threadTs,
+      text: `💬 티켓 #${ticketId} 답장 전달됨`,
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: `💬 *답장을 전달했어요.*\n> ${truncate(text || '', 2800)}` } },
+      ],
+    });
+  } catch (e) {
+    console.error('답장 처리 실패:', e);
+    try {
+      if (web) await web.chat.postMessage({ channel: dest, thread_ts: threadTs, text: `⚠️ 티켓 #${ticketId} 답장 전송 중 오류가 발생했습니다.` });
+    } catch {}
+  }
+  return { ok: true };
+}
+
 // ── 헬퍼: 비동기 워커 (Bedrock 처리 후 response_url로 게시) ──
 async function handleAskWorker(event) {
   try {
@@ -667,19 +1030,31 @@ function options(pairs) {
   }));
 }
 
-function selectInput(block_id, label, opts, { optional = false, placeholder = '선택', hint } = {}) {
+function selectInput(
+  block_id,
+  label,
+  opts,
+  { optional = false, placeholder = '선택', hint, actionId = 'value', dispatch = false, initialValue } = {}
+) {
+  const element = {
+    type: 'static_select',
+    action_id: actionId,
+    placeholder: { type: 'plain_text', text: placeholder },
+    options: opts,
+  };
+  // views.update로 재렌더 시 이전 선택값 유지
+  if (initialValue !== undefined) {
+    const match = opts.find((o) => o.value === initialValue);
+    if (match) element.initial_option = match;
+  }
   const block = {
     type: 'input',
     block_id,
     optional,
     label: { type: 'plain_text', text: label },
-    element: {
-      type: 'static_select',
-      action_id: 'value',
-      placeholder: { type: 'plain_text', text: placeholder },
-      options: opts,
-    },
+    element,
   };
+  if (dispatch) block.dispatch_action = true; // 선택 변경 시 block_actions 발생
   if (hint) block.hint = { type: 'plain_text', text: hint };
   return block;
 }
@@ -720,45 +1095,64 @@ function parseAttachments(fileState) {
 }
 
 // ── 문의 모달 정의 (스마일샤크 Zendesk 양식 기준) ───────────
-function buildTicketModal() {
+// state.company 선택 시 그 회사 소속 직원(요청자) 드롭다운을 동적으로 노출.
+function buildTicketModal(state = {}) {
+  const { company, channelId } = state;
+
+  const blocks = [
+    selectInput('form_type', '양식', options([
+      ['기술문의'], ['비용문의'], ['샤크몬 문의'], ['내부문서요청'], ['인시던트'], ['미팅협의'],
+    ])),
+    selectInput('tech_area', '기술 분야', options([
+      ['AWS'], ['Datadog'], ['NHN'],
+    ]), { optional: true, hint: '기술문의인 경우 선택하세요' }),
+    // 회사 선택: 변경 시 dispatch → 요청자 목록 갱신
+    selectInput('company', '회사', options(Object.keys(COMPANY_DIRECTORY).map((c) => [c])), {
+      actionId: 'company_action', dispatch: true, initialValue: company, placeholder: '회사 선택',
+    }),
+  ];
+
+  // 회사를 고르면 그 회사 직원(요청자) 드롭다운 표시
+  if (company && COMPANY_DIRECTORY[company]) {
+    blocks.push(
+      selectInput('requester', '요청자', options(
+        COMPANY_DIRECTORY[company].map((m) => [`${m.name} (${m.email})`, m.email])
+      ), { placeholder: '요청자 선택' })
+    );
+  }
+
+  blocks.push(
+    textInput('aws_account', 'AWS 계정 ID (Account Number)', {
+      optional: true,
+      multiline: true,
+      placeholder: '작업 필요한 계정 ID (여러 개면 줄바꿈으로 구분)',
+    }),
+    selectInput('support_plan', 'AWS 서포트 플랜', options([
+      ['Basic'], ['Developer'], ['Business'], ['Enterprise On-Ramp'], ['Enterprise'],
+    ]), { optional: true }),
+    selectInput('urgency', '긴급도', options([
+      ['높음', 'high'], ['중간', 'normal'], ['낮음', 'low'],
+    ])),
+    textInput('cc', '참조 (CC)', {
+      optional: true,
+      multiline: true,
+      placeholder: '참조할 이메일 (여러 명이면 줄바꿈으로 구분)',
+      hint: '입력한 이메일이 Zendesk 티켓 참조자로 등록됩니다',
+    }),
+    textInput('subject', '제목', { max: 150, placeholder: '문의 제목을 입력하세요' }),
+    textInput('description', '문의 내용', { multiline: true, max: 3000, placeholder: '문의 상세 내용을 입력하세요' }),
+    fileInputBlock('attachments', '사진/파일 첨부')
+  );
+
   return {
     type: 'modal',
     callback_id: 'ticket_modal',
+    // /zendesk가 실행된 채널을 보관 → 접수·담당자 답변·답장을 이 채널의 스레드로 라우팅
+    private_metadata: JSON.stringify({ channelId: channelId || '' }),
     title: { type: 'plain_text', text: '젠데스크 문의' },
     submit: { type: 'plain_text', text: '문의 접수' },
     close: { type: 'plain_text', text: '취소' },
-    blocks: [
-      selectInput('form_type', '양식', options([
-        ['기술문의'], ['비용문의'], ['샤크몬 문의'], ['내부문서요청'], ['인시던트'], ['미팅협의'],
-      ])),
-      selectInput('tech_area', '기술 분야', options([
-        ['AWS'], ['Datadog'], ['NHN'],
-      ]), { optional: true, hint: '기술문의인 경우 선택하세요' }),
-      textInput('requester_email', '요청자 이메일', {
-        placeholder: '요청자 이메일 주소',
-      }),
-      textInput('company', '회사명', { placeholder: '고객사 회사명' }),
-      textInput('aws_account', 'AWS 계정 ID (Account Number)', {
-        optional: true,
-        multiline: true,
-        placeholder: '작업 필요한 계정 ID (여러 개면 줄바꿈으로 구분)',
-      }),
-      selectInput('support_plan', 'AWS 서포트 플랜', options([
-        ['Basic'], ['Developer'], ['Business'], ['Enterprise On-Ramp'], ['Enterprise'],
-      ]), { optional: true }),
-      selectInput('urgency', '긴급도', options([
-        ['높음', 'high'], ['중간', 'normal'], ['낮음', 'low'],
-      ])),
-      textInput('cc', '참조 (CC)', {
-        optional: true,
-        multiline: true,
-        placeholder: '참조할 이메일 (여러 명이면 줄바꿈으로 구분)',
-        hint: '입력한 이메일이 Zendesk 티켓 참조자로 등록됩니다',
-      }),
-      textInput('subject', '제목', { max: 150, placeholder: '문의 제목을 입력하세요' }),
-      textInput('description', '문의 내용', { multiline: true, max: 3000, placeholder: '문의 상세 내용을 입력하세요' }),
-      fileInputBlock('attachments', '사진/파일 첨부'),
-    ],
+    blocks,
   };
 }
 
@@ -769,6 +1163,12 @@ export const handler = async (event, context) => {
   // 비동기 self-invoke(워커) 페이로드 처리
   if (event && event.__askWorker) {
     return handleAskWorker(event);
+  }
+  if (event && event.__ticketWorker) {
+    return handleTicketWorker(event);
+  }
+  if (event && event.__replyWorker) {
+    return handleReplyWorker(event);
   }
   return slackHandler(event, context);
 };

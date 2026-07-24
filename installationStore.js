@@ -20,6 +20,12 @@ const idFromQuery = (q) =>
 // 티켓 매핑 키 (같은 테이블 재사용: id = "ticket:<ticketId>")
 const ticketKey = (ticketId) => `ticket:${ticketId}`;
 
+// 회사 태그 ↔ 워크스페이스 매핑 키 (같은 테이블 재사용: id = "company:<tag>")
+const companyKey = (companyTag) => `company:${companyTag}`;
+
+// 고객 이메일 ↔ Slack 사용자 매핑 키 (같은 테이블 재사용: id = "user:<email 소문자>")
+const userEmailKey = (email) => `user:${String(email).trim().toLowerCase()}`;
+
 // 공유 DynamoDB 문서 클라이언트 (TABLE 있을 때만 생성)
 const ddb = TABLE
   ? DynamoDBDocumentClient.from(new DynamoDBClient({}), {
@@ -99,4 +105,66 @@ export async function fetchTicketMapping(ticketId) {
     return res.Item || null;
   }
   return ticketMemory.get(String(ticketId)) || null;
+}
+
+// ── 회사(커스텀 필드 태그) ↔ 워크스페이스 매핑 (상담사-먼저 티켓 라우팅용) ──
+// 고객이 /zendesk로 처음 티켓을 만들 때 자동 저장 → 이후 상담사가 직접 만든 티켓을
+// 회사 커스텀 필드로 어느 워크스페이스에 보낼지 역조회한다. (고객사 많아도 무설정)
+const companyMemory = new Map();
+
+// data: { teamId, enterpriseId?, isEnterpriseInstall? }
+export async function storeCompanyTeam(companyTag, data) {
+  if (!companyTag) return;
+  if (ddb) {
+    await ddb.send(
+      new PutCommand({
+        TableName: TABLE,
+        Item: { id: companyKey(companyTag), kind: 'company_team', ...data },
+      })
+    );
+  } else {
+    companyMemory.set(String(companyTag), data);
+  }
+}
+
+export async function fetchCompanyTeam(companyTag) {
+  if (!companyTag) return null;
+  if (ddb) {
+    const res = await ddb.send(
+      new GetCommand({ TableName: TABLE, Key: { id: companyKey(companyTag) } })
+    );
+    return res.Item || null;
+  }
+  return companyMemory.get(String(companyTag)) || null;
+}
+
+// ── 고객 이메일 ↔ Slack 사용자 매핑 (상담사-먼저 티켓 라우팅 1순위) ──
+// 이메일 별칭(+alias) 때문에 users.lookupByEmail이 실패할 수 있으므로,
+// 고객이 /zendesk로 티켓 만들 때 이메일→{teamId,userId}를 직접 기록해 정확히 라우팅한다.
+const userEmailMemory = new Map();
+
+// data: { teamId, enterpriseId?, isEnterpriseInstall?, userId }
+export async function storeUserByEmail(email, data) {
+  if (!email) return;
+  if (ddb) {
+    await ddb.send(
+      new PutCommand({
+        TableName: TABLE,
+        Item: { id: userEmailKey(email), kind: 'user_email', ...data },
+      })
+    );
+  } else {
+    userEmailMemory.set(String(email).trim().toLowerCase(), data);
+  }
+}
+
+export async function fetchUserByEmail(email) {
+  if (!email) return null;
+  if (ddb) {
+    const res = await ddb.send(
+      new GetCommand({ TableName: TABLE, Key: { id: userEmailKey(email) } })
+    );
+    return res.Item || null;
+  }
+  return userEmailMemory.get(String(email).trim().toLowerCase()) || null;
 }
