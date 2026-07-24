@@ -222,7 +222,12 @@ receiver.app.post('/zendesk/webhook', express.json(), async (req, res) => {
         {
           type: 'context',
           elements: [
-            { type: 'mrkdwn', text: `상태: ${STATUS_LABEL[status] || status || '-'}   ·   \`/zendesk-status\` 로 전체 확인` },
+            {
+              type: 'mrkdwn',
+              text:
+                `🔗 <https://${ZENDESK_SUBDOMAIN}.zendesk.com/hc/requests/${ticket_id}|티켓 #${ticket_id} 진행상황 보기>   ·   ` +
+                `상태: ${STATUS_LABEL[status] || status || '-'}   ·   \`/zendesk-status\` 로 전체 확인`,
+            },
           ],
         },
       ],
@@ -606,6 +611,33 @@ async function uploadFilesToZendesk(files, botToken) {
   return token || null;
 }
 
+// ── 헬퍼: 고객이 첨부한 파일(Slack)을 채널 스레드에도 다시 올려 대화 로그 완성 ──
+// 모달 file_input 파일은 채널에 안 보이므로, Zendesk 업로드와 별개로 스레드에 재게시한다.
+async function uploadSlackFilesToThread(web, dest, threadTs, files, botToken) {
+  if (!files?.length) return;
+  // 업로드 대상 채널 확정: 사용자 ID면 DM 채널 오픈, 채널이면 봇 참여(파일 업로드는 멤버 필요)
+  let channelId = dest;
+  if (dest && dest[0] === 'U') {
+    try {
+      const im = await web.conversations.open({ users: dest });
+      channelId = im.channel?.id || dest;
+    } catch (e) { /* noop */ }
+  } else {
+    await ensureBotInChannel(web, dest);
+  }
+  for (const f of files) {
+    if (!f.url) continue;
+    try {
+      const dl = await fetch(f.url, { headers: { Authorization: `Bearer ${botToken}` } });
+      if (!dl.ok) { console.error(`Slack 파일 다운로드 실패 ${dl.status}: ${f.name}`); continue; }
+      const buf = Buffer.from(await dl.arrayBuffer());
+      await web.files.uploadV2({ channel_id: channelId, thread_ts: threadTs, file: buf, filename: f.name || 'attachment' });
+    } catch (e) {
+      console.error(`첨부 스레드 업로드 실패: ${f.name}`, e?.data?.error || e);
+    }
+  }
+}
+
 // ── 헬퍼: 티켓 요청자(고객) 사용자 ID 조회 ─────────────────
 async function fetchTicketRequesterId(ticketId) {
   if (!zendeskEnabled) return null;
@@ -897,6 +929,18 @@ async function handleTicketWorker(event) {
         ],
       },
     ];
+    // 고객이 진행상황을 직접 볼 수 있는 Zendesk 요청 페이지 링크 (Help Center 기준)
+    if (ticket && zendeskEnabled) {
+      confirmBlocks.push({
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: `🔗 <https://${ZENDESK_SUBDOMAIN}.zendesk.com/hc/requests/${ticket.id}|티켓 #${ticket.id} 진행상황 보기>   ·   Slack에서 \`/zendesk-status\` 로도 확인`,
+          },
+        ],
+      });
+    }
     if (ticket) confirmBlocks.push(replyButton(ticket.id));
 
     // 접수 메시지를 지원 채널에 게시해 이 티켓의 "스레드 루트"로 삼는다.
@@ -924,6 +968,11 @@ async function handleTicketWorker(event) {
       } catch (e2) {
         console.error('DM 폴백 게시도 실패:', e2?.data?.error || e2);
       }
+    }
+
+    // 고객이 첨부한 사진을 접수 스레드에도 표시 (Zendesk뿐 아니라 채널에도)
+    if (form.files?.length && threadTs) {
+      await uploadSlackFilesToThread(web, postChannel, threadTs, form.files, botToken);
     }
 
     // 양방향 동기화: 티켓 ↔ {채널·스레드·요청자} 매핑 저장 (웹훅/답장 회신 대상)
@@ -994,6 +1043,11 @@ async function handleReplyWorker(event) {
         { type: 'section', text: { type: 'mrkdwn', text: `💬 *답장을 전달했어요.*\n> ${truncate(text || '', 2800)}` } },
       ],
     });
+
+    // 고객이 첨부한 사진도 같은 스레드에 표시 (Zendesk뿐 아니라 채널에도)
+    if (files?.length) {
+      await uploadSlackFilesToThread(web, dest, threadTs, files, botToken);
+    }
   } catch (e) {
     console.error('답장 처리 실패:', e);
     try {
@@ -1078,8 +1132,8 @@ function fileInputBlock(block_id, label) {
     element: {
       type: 'file_input',
       action_id: 'files',
-      // Slack이 인식하는 filetype 슬러그만 사용 (jpg가 jpeg 포함)
-      filetypes: ['png', 'jpg', 'gif', 'pdf'],
+      // filetypes 미지정 = 모든 파일 형식 허용 (사진·pdf뿐 아니라 md·xlsx·csv·docx·zip 등).
+      // 특정 슬러그로 제한하면 목록 밖 형식이 막히고, 잘못된 슬러그는 모달을 못 열게 하므로 제한 없음.
       max_files: 5,
     },
   };
