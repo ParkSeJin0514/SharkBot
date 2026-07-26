@@ -18,11 +18,14 @@
                     │                     │    · 회사 → 지원 채널       │
                     │                     ├─ Zendesk API (커스텀 필드) │
                     │                     ├─ self-invoke 워커(비동기)  │
-                    │                     └─ Bedrock (AI 답변)         │
+                    │                     └─ /ask → 버지니아 에이전트   │
                     └───────────────────────────────────────────────┘
 
 [담당자] Zendesk 공개답변/티켓생성 ─ 트리거 ─► 웹훅 POST /zendesk/webhook
-                                              └─► 그 고객사 지원 채널 스레드로 회신(텍스트+사진)
+                                              └─► 그 고객사 슬랙 스레드로 회신(텍스트+사진)
+
+[/ask] 서울 SharkBot ─ HTTPS(ASK_AGENT_URL) ─► 버지니아(us-east-1) 에이전트
+        (Strands + Bedrock) → 비용(MCP 게이트웨이)·리소스(로컬 boto3) → Slack 회신
 ```
 
 - **설치**: 고객이 `/slack/install`로 OAuth 승인 → 워크스페이스별 봇 토큰을 **DynamoDB**에 저장
@@ -39,7 +42,7 @@
 | **파일 첨부(전 형식)** | 모달 `file_input`(png/jpg/pdf·**md/xlsx/csv/docx/zip 등 전 형식**) → Zendesk 티켓 + **채널 스레드에도 표시** | ✅ 배포 |
 | **양방향 동기화(담당자→고객)** | 담당자가 Zendesk에서 공개 답변/티켓 생성 → 그 **고객사 지원 채널 스레드**로 자동 회신 (텍스트 + **첨부 사진**) | ⚙️ 코드 완료 / 재설치·웹훅 설정 후 실동작 |
 | **상담사-먼저 티켓 라우팅** | 상담사가 직접 만든 티켓을 **회사 커스텀 필드**로 그 고객사 채널에 라우팅 | ⚙️ 코드 완료 / 위와 동일 |
-| **`/ask`** | AWS 사용법·개념 질문에 Bedrock 기반 AI가 한국어로 답변 | ⏸️ 코드 완료 / SCP 대기 |
+| **`/ask`** | 질문을 **버지니아(us-east-1) AgentCore 에이전트**로 넘겨 비용(MCP 게이트웨이)·리소스(로컬 boto3)를 조회해 한국어 답변. 서울은 진입·게시만 | ✅ 데모 실동작 |
 
 ### `/zendesk` 문의 폼 필드
 양식 · 기술 분야(AWS/Datadog/NHN) · **회사(드롭다운)** · **요청자(회사 선택 시 직원 드롭다운)** · 참조(CC) · 제목 · AWS 계정 ID · AWS 서포트 플랜 · 긴급도 · 문의 내용 · 사진/파일 첨부
@@ -67,6 +70,21 @@
 - **고객 답장 첨부**도 같은 스레드에 재게시 → 고객이 보낸 파일이 Zendesk뿐 아니라 채널 스레드에도 표시(`uploadSlackFilesToThread`)
 - 웹훅은 커스텀 헤더 시크릿(`X-Sharkbot-Token`)으로 검증, 담당자(agent/admin) 답변만 전달(echo 방지)
 - **활성화 조건**: ① Zendesk 웹훅·트리거(관리자 권한) + ② `files:write`·`channels:join` 추가 후 **재설치** + ③ 워커 self-invoke용 `lambda:InvokeFunction`
+
+### `/ask` — 서울 → 버지니아 에이전트 (크로스 리전)
+AgentCore가 **버지니아(us-east-1)에서만 지원**되어, `/ask`의 두뇌는 버지니아에 두고 서울은 진입·게시만 담당한다.
+```
+Slack /ask → 서울 SharkBot (즉시 ack)
+   → 워커가 ASK_AGENT_URL(버지니아 API GW)로 HTTPS POST {question}   ← 서울↔버지니아 연결점
+   → 버지니아 에이전트(Strands + Bedrock Nova Lite) 루프
+        · 비용 질문  → Cognito JWT → AgentCore MCP 게이트웨이 → get_cost_summary (시연값)
+        · 리소스 질문 → 계정 로컬 boto3 (EC2/Lambda/S3, 실제 Read-Only)
+   → answer 반환 → 서울이 Slack response_url로 게시 (`<thinking>` 제거)
+```
+- **연결**: 서울 Lambda 환경변수 `ASK_AGENT_URL` = 버지니아 API GW URL. 크로스 리전은 단순 HTTPS(같은 계정).
+- **SCP 우회**: Bedrock이 버지니아 계정에서 실행되어 서울에서 막혔던 조직 SCP를 우회.
+- **주의**: 에이전트 응답이 ~수 초라 **서울 Lambda 타임아웃을 넉넉히(60초)**. 코드: `app.js`의 `callAskAgent`/`handleAskWorker`.
+- **역할 경계**: MCP 게이트웨이·비용/가이드 툴 = 별도 담당(MCP), 서울 `/ask` 진입·연결 = SharkBot(본 저장소).
 
 ## 구성 요소
 

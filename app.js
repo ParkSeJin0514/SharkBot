@@ -1057,10 +1057,29 @@ async function handleReplyWorker(event) {
   return { ok: true };
 }
 
-// ── 헬퍼: 비동기 워커 (Bedrock 처리 후 response_url로 게시) ──
+// ── 헬퍼: 버지니아(us-east-1) 에이전트 API 호출 ──────────────
+// AgentCore는 버지니아에서만 지원되므로 /ask 두뇌는 버지니아 에이전트 Lambda가 담당.
+// 서울은 진입·게시만 하고, 실제 Bedrock+MCP 처리는 이 API가 수행한다.
+// ASK_AGENT_URL 미설정 시 로컬 Bedrock(askBedrock)로 폴백.
+async function callAskAgent(question) {
+  const url = process.env.ASK_AGENT_URL;
+  if (!url) return askBedrock(question); // 폴백(로컬)
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question }),
+  });
+  if (!res.ok) throw new Error(`Agent ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  const answer = data.answer || '(답변을 생성하지 못했습니다.)';
+  // 모델 내부 사고(<thinking>...</thinking>)는 사용자에게 안 보이게 제거
+  return answer.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '').trim() || '(답변을 생성하지 못했습니다.)';
+}
+
+// ── 헬퍼: 비동기 워커 (에이전트 처리 후 response_url로 게시) ──
 async function handleAskWorker(event) {
   try {
-    const answer = await askBedrock(event.text);
+    const answer = await callAskAgent(event.text);
     await postToResponseUrl(event.response_url, answer);
   } catch (e) {
     await postToResponseUrl(event.response_url, `⚠️ 답변 생성 중 오류가 발생했습니다: ${e.message}`);
