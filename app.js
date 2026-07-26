@@ -878,10 +878,13 @@ async function ensureBotInChannel(web, channelId) {
   try {
     await web.conversations.join({ channel: channelId });
   } catch (e) {
-    // already_in_channel 이면 정상, method_not_supported_for_channel_type/비공개면 초대 필요
+    // already_in_channel: 이미 멤버(정상)
+    // missing_scope: channels:join 미보유 — 수동 /invite 방침에선 정상. 봇이 이미 초대돼 있으면
+    //   이후 files.uploadV2가 그대로 성공하고, 아니면 uploadV2가 not_in_channel로 진짜 실패를 알림.
     const err = e?.data?.error;
-    if (err && err !== 'already_in_channel') {
-      console.error(`채널 자동 참여 실패(${channelId}): ${err} — 비공개 채널이면 봇 초대 필요`);
+    const benign = new Set(['already_in_channel', 'missing_scope']);
+    if (err && !benign.has(err)) {
+      console.error(`채널 참여 시도 실패(${channelId}): ${err} — 비공개 채널이면 봇 초대 필요`);
     }
   }
 }
