@@ -74,12 +74,12 @@
 1. `/zendesk` 티켓 생성 시 `티켓 ↔ {채널, 스레드}` + `회사 → 지원 채널` + `이메일 → 사용자` 매핑을 DynamoDB에 자동 저장(자동 채움)
 2. Zendesk 트리거가 **담당자 공개 답변/티켓 생성** 시 웹훅(`/zendesk/webhook`) 호출
 3. Lambda가 최근 공개 코멘트(텍스트+첨부) 조회 → 그 고객사 **지원 채널 스레드**에 게시. 봇 매핑이 없는(상담사-먼저) 티켓은 **회사 커스텀 필드**로 채널 해석(`routeAgentTicket`)
-4. 첨부(사진)는 Zendesk에서 다운로드 → **Slack `files.uploadV2`로 같은 스레드에 업로드**. 파일 업로드는 봇이 채널 멤버여야 하므로 `conversations.join`으로 공개 채널 자동 참여
+4. 첨부(사진)는 Zendesk에서 다운로드 → **Slack `files.uploadV2`로 같은 스레드에 업로드**. 파일 업로드는 봇이 채널 멤버여야 하므로 **채널마다 봇을 수동 `/invite`** 해 둔다
 - **티켓 = 채널 안 스레드 1개**로 정리. 새 티켓 첫 등장이면 "📩 새 티켓", 이후는 "💬 담당자 답변". 두 메시지 모두 **진행상황 링크** 포함
 - **고객 답장 첨부**도 같은 스레드에 재게시 → 고객이 보낸 파일이 Zendesk뿐 아니라 채널 스레드에도 표시(`uploadSlackFilesToThread`)
 - 웹훅은 커스텀 헤더 시크릿(`X-Sharkbot-Token`)으로 검증, 담당자(agent/admin) 답변만 전달(echo 방지)
 - **활성화 조건**: ① Zendesk 웹훅·트리거(관리자 권한) + ② `files:write` 추가 후 **재설치** + ③ 워커 self-invoke용 `lambda:InvokeFunction`
-- **채널 참여**: 봇을 슬랙 채널에 **수동 `/invite @SharkBot`**(파일 업로드는 봇이 채널 멤버여야 가능). `ensureBotInChannel`의 `conversations.join`은 스코프 없으면 실패하지만 try/catch로 무해 — 초대만 돼 있으면 정상 동작
+- **채널 참여**: 봇을 슬랙 채널에 **수동 `/invite @SharkBot`**(파일 업로드는 봇이 채널 멤버여야 가능). `ensureBotInChannel`의 `conversations.join`은 `channels:join` 스코프가 없어 `missing_scope`로 실패하지만, 이를 `already_in_channel`과 함께 **무해(benign)로 간주해 에러 로그를 남기지 않는다** — 초대만 돼 있으면 정상 동작하고, 봇이 진짜 채널에 없을 때만 `uploadV2`가 `not_in_channel`로 실제 실패를 알린다
 
 ### `/ask` — 서울 → 버지니아 에이전트 (크로스 리전)
 AgentCore가 **버지니아(us-east-1)에서만 지원**되어, `/ask`의 두뇌는 버지니아에 두고 서울은 진입·게시만 담당한다 (전체 흐름은 위 아키텍처 참고).
