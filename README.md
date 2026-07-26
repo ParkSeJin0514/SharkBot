@@ -78,7 +78,8 @@
 - **티켓 = 채널 안 스레드 1개**로 정리. 새 티켓 첫 등장이면 "📩 새 티켓", 이후는 "💬 담당자 답변". 두 메시지 모두 **진행상황 링크** 포함
 - **고객 답장 첨부**도 같은 스레드에 재게시 → 고객이 보낸 파일이 Zendesk뿐 아니라 채널 스레드에도 표시(`uploadSlackFilesToThread`)
 - 웹훅은 커스텀 헤더 시크릿(`X-Sharkbot-Token`)으로 검증, 담당자(agent/admin) 답변만 전달(echo 방지)
-- **활성화 조건**: ① Zendesk 웹훅·트리거(관리자 권한) + ② `files:write`·`channels:join` 추가 후 **재설치** + ③ 워커 self-invoke용 `lambda:InvokeFunction`
+- **활성화 조건**: ① Zendesk 웹훅·트리거(관리자 권한) + ② `files:write` 추가 후 **재설치** + ③ 워커 self-invoke용 `lambda:InvokeFunction`
+- **채널 참여**: 봇을 슬랙 채널에 **수동 `/invite @SharkBot`**(파일 업로드는 봇이 채널 멤버여야 가능). `ensureBotInChannel`의 `conversations.join`은 스코프 없으면 실패하지만 try/catch로 무해 — 초대만 돼 있으면 정상 동작
 
 ### `/ask` — 서울 → 버지니아 에이전트 (크로스 리전)
 AgentCore가 **버지니아(us-east-1)에서만 지원**되어, `/ask`의 두뇌는 버지니아에 두고 서울은 진입·게시만 담당한다 (전체 흐름은 위 아키텍처 참고).
@@ -110,8 +111,7 @@ AgentCore가 **버지니아(us-east-1)에서만 지원**되어, `/ask`의 두뇌
 | `users:read` / `users:read.email` | 요청자(고객) 이메일 매핑 |
 | `im:write` | DM 회신(폴백) |
 | `files:read` | 고객 첨부 다운로드(→ Zendesk 업로드) |
-| `files:write` | 담당자 첨부를 고객사 지원 채널에 업로드 (양방향 동기화용) |
-| `channels:join` | 파일 업로드 위해 지원 채널(공개) 자동 참여 |
+| `files:write` | 담당자 첨부를 고객사 슬랙 채널에 업로드 (양방향 동기화용) |
 
 ## 문서
 

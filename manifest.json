@@ -38,8 +38,7 @@
         "users:read.email",
         "im:write",
         "files:read",
-        "files:write",
-        "channels:join"
+        "files:write"
       ]
     }
   },
