@@ -1,32 +1,41 @@
 # SharkBot
 
-고객사가 **자기 회사 Slack에서** AWS 콘솔·Zendesk 포털을 거치지 않고, 스마일샤크에 문의를 보내고 진행 상황까지 확인할 수 있게 하는 **멀티테넌트 Slack 봇**.
+고객사가 **자기 회사 Slack에서** AWS 콘솔·Zendesk 포털을 거치지 않고 스마일샤크에 문의하고, AWS 비용·리소스까지 물어볼 수 있게 하는 **멀티테넌트 Slack 봇**.
 
-여러 고객사가 각자 워크스페이스에 설치(OAuth)해 사용하며, **HTTP + OAuth** 방식으로 AWS(Lambda)에 서버리스로 배포된다.
+- **`/zendesk`** — 문의를 Zendesk 티켓으로 발행하고 담당자와 **양방향**으로 대화 (진행 상황까지 Slack에서 확인)
+- **`/ask`** — AWS 비용·리소스 질문을 **AI 에이전트**가 조회해 한국어로 답변
+
+여러 고객사가 각자 워크스페이스에 OAuth로 설치해 쓰며, **서버리스(Lambda · API Gateway · DynamoDB)** 로 배포된다.
 
 ## 아키텍처
 
 ```
-                    ┌───────────────────────────────────────────────┐
-[고객사 A/B/C Slack] │  /zendesk         (티켓 발행 모달)              │
-        │           │  /zendesk-status  (내 티켓 상태 조회)           │
-        │  HTTPS    │  /ask             (AWS 질문 → AI 답변)          │
-        └──────────►│  API Gateway ──► Lambda (Bolt, HTTP + OAuth)    │
-                    │                     ├─ DynamoDB                 │
-                    │                     │    · 고객사별 설치 토큰     │
-                    │                     │    · 티켓 ↔ 채널·스레드     │
-                    │                     │    · 회사 → 지원 채널       │
-                    │                     ├─ Zendesk API (커스텀 필드) │
-                    │                     ├─ self-invoke 워커(비동기)  │
-                    │                     └─ /ask → 버지니아 에이전트   │
-                    └───────────────────────────────────────────────┘
-
-[담당자] Zendesk 공개답변/티켓생성 ─ 트리거 ─► 웹훅 POST /zendesk/webhook
-                                              └─► 그 고객사 슬랙 스레드로 회신(텍스트+사진)
-
-[/ask] 서울 SharkBot ─ HTTPS(ASK_AGENT_URL) ─► 버지니아(us-east-1) 에이전트
-        (Strands + Bedrock) → 비용(MCP 게이트웨이)·리소스(로컬 boto3) → Slack 회신
+                       ┌──────────────── 서울 (ap-northeast-2) ────────────────┐
+[고객사 A/B/C Slack]   │  API Gateway ──► Lambda (SharkBot · Bolt, HTTP+OAuth)  │
+   /zendesk        ───►│                    ├─ DynamoDB                         │
+   /zendesk-status ───►│                    │    · 고객사별 설치 토큰(멀티테넌트) │
+   답장 버튼        ───►│                    │    · 티켓 ↔ 슬랙(채널·스레드)       │
+   /ask            ───►│                    │    · 회사 → 슬랙 / 이메일 → 사용자  │
+        ▲              │                    ├─ Zendesk API (티켓·커스텀 필드)    │
+        │              │                    └─ self-invoke 워커(비동기)          │
+        │              │                         ├─ /zendesk: 티켓 생성·채널 게시 │
+        │              │                         └─ /ask: 버지니아로 넘김 ─────┐  │
+        │              └──────────────────────────────────────────────────────┼──┘
+        │  ① 담당자 답변/티켓 → 트리거 → 웹훅 → 슬랙 스레드 회신                  │
+        │                                                    ② ASK_AGENT_URL   │
+        │                                                       (HTTPS POST)   │
+    [Zendesk]                                                        ▼
+                       ┌──────────────── 버지니아 (us-east-1) ─────────────────┐
+                       │  API Gateway ──► 에이전트 Lambda (Strands + Bedrock)   │
+                       │                    │  질문 성격에 따라 도구 자동 선택   │
+                       │        ┌───────────┴───────────┐                       │
+                       │   [비용] Cognito JWT       [리소스] 계정 로컬          │
+                       │        → MCP 게이트웨이         boto3 (EC2/Lambda/S3   │
+                       │        → get_cost_summary       · 실제 Read-Only)      │
+                       │  → answer 반환 → 서울이 Slack response_url로 게시       │
+                       └───────────────────────────────────────────────────────┘
 ```
+> `/zendesk`는 서울에서 자기완결, `/ask`는 서울이 진입만 하고 **버지니아 에이전트**로 넘긴다(AgentCore가 버지니아만 지원 → SCP 우회). 둘을 잇는 건 환경변수 **`ASK_AGENT_URL`** 하나.
 
 - **설치**: 고객이 `/slack/install`로 OAuth 승인 → 워크스페이스별 봇 토큰을 **DynamoDB**에 저장
 - **멀티테넌트**: 요청의 team_id로 해당 고객사 토큰을 조회해 응답 → 여러 고객사에 동시 배포
@@ -72,19 +81,12 @@
 - **활성화 조건**: ① Zendesk 웹훅·트리거(관리자 권한) + ② `files:write`·`channels:join` 추가 후 **재설치** + ③ 워커 self-invoke용 `lambda:InvokeFunction`
 
 ### `/ask` — 서울 → 버지니아 에이전트 (크로스 리전)
-AgentCore가 **버지니아(us-east-1)에서만 지원**되어, `/ask`의 두뇌는 버지니아에 두고 서울은 진입·게시만 담당한다.
-```
-Slack /ask → 서울 SharkBot (즉시 ack)
-   → 워커가 ASK_AGENT_URL(버지니아 API GW)로 HTTPS POST {question}   ← 서울↔버지니아 연결점
-   → 버지니아 에이전트(Strands + Bedrock Nova Lite) 루프
-        · 비용 질문  → Cognito JWT → AgentCore MCP 게이트웨이 → get_cost_summary (시연값)
-        · 리소스 질문 → 계정 로컬 boto3 (EC2/Lambda/S3, 실제 Read-Only)
-   → answer 반환 → 서울이 Slack response_url로 게시 (`<thinking>` 제거)
-```
-- **연결**: 서울 Lambda 환경변수 `ASK_AGENT_URL` = 버지니아 API GW URL. 크로스 리전은 단순 HTTPS(같은 계정).
-- **SCP 우회**: Bedrock이 버지니아 계정에서 실행되어 서울에서 막혔던 조직 SCP를 우회.
-- **주의**: 에이전트 응답이 ~수 초라 **서울 Lambda 타임아웃을 넉넉히(60초)**. 코드: `app.js`의 `callAskAgent`/`handleAskWorker`.
-- **역할 경계**: MCP 게이트웨이·비용/가이드 툴 = 별도 담당(MCP), 서울 `/ask` 진입·연결 = SharkBot(본 저장소).
+AgentCore가 **버지니아(us-east-1)에서만 지원**되어, `/ask`의 두뇌는 버지니아에 두고 서울은 진입·게시만 담당한다 (전체 흐름은 위 아키텍처 참고).
+- **연결**: 서울 `/ask` 즉시 ack → 워커가 환경변수 **`ASK_AGENT_URL`**(버지니아 API GW)로 `{question}` HTTPS POST → 답변을 Slack `response_url`로 게시(`<thinking>` 제거). 코드: `app.js`의 `callAskAgent`/`handleAskWorker`
+- **도구**: 비용 = MCP 게이트웨이 경유 `get_cost_summary`(시연값) · 리소스 = 계정 로컬 boto3(실제 Read-Only)
+- **SCP 우회**: Bedrock이 버지니아 계정에서 실행되어 서울에서 막혔던 조직 SCP를 우회
+- **주의**: 에이전트 응답이 수 초라 **서울 Lambda 타임아웃 60초** 필요
+- **역할 경계**: MCP 게이트웨이·툴 = 별도 담당(MCP), 서울 `/ask` 진입·연결 = SharkBot(본 저장소)
 
 ## 구성 요소
 
@@ -97,7 +99,7 @@ Slack /ask → 서울 SharkBot (즉시 ack)
 | Lambda `sharkbot` | 실행 런타임 (Node.js 22.x, `app.handler`) + 비동기 self-invoke 워커 |
 | DynamoDB `sharkbot-installations` | 설치 토큰 + 라우팅 매핑(티켓·회사·이메일) — 한 테이블 `id` 프리픽스로 구분 |
 
-**기술 스택**: Node.js · Slack Bolt(HTTP + OAuth) · AWS Lambda / API Gateway / DynamoDB · Zendesk API · Amazon Bedrock
+**기술 스택**: Node.js · Slack Bolt(HTTP + OAuth) · AWS Lambda / API Gateway / DynamoDB · Zendesk API · `/ask`는 **버지니아 AgentCore 에이전트**(Bedrock·Strands·MCP) 연동
 
 ## OAuth 스코프
 
