@@ -10,32 +10,39 @@
 ## 아키텍처
 
 ```
-                       ┌──────────────── 서울 (ap-northeast-2) ────────────────┐
-[고객사 A/B/C Slack]   │  API Gateway ──► Lambda (SharkBot · Bolt, HTTP+OAuth)  │
-   /zendesk        ───►│                    ├─ DynamoDB                         │
-   /zendesk-status ───►│                    │    · 고객사별 설치 토큰(멀티테넌트) │
-   답장 버튼        ───►│                    │    · 티켓 ↔ 슬랙(채널·스레드)       │
-   /ask            ───►│                    │    · 회사 → 슬랙 / 이메일 → 사용자  │
-        ▲              │                    ├─ Zendesk API (티켓·커스텀 필드)    │
-        │              │                    └─ self-invoke 워커(비동기)          │
-        │              │                         ├─ /zendesk: 티켓 생성·채널 게시 │
-        │              │                         └─ /ask: 버지니아로 넘김 ─────┐  │
-        │              └──────────────────────────────────────────────────────┼──┘
-        │  ① 담당자 답변/티켓 → 트리거 → 웹훅 → 슬랙 스레드 회신                  │
-        │                                                    ② ASK_AGENT_URL   │
-        │                                                       (HTTPS POST)   │
-    [Zendesk]                                                        ▼
-                       ┌──────────────── 버지니아 (us-east-1) ─────────────────┐
-                       │  API Gateway ──► 에이전트 Lambda (Strands + Bedrock)   │
-                       │                    │  질문 성격에 따라 도구 자동 선택   │
-                       │        ┌───────────┴───────────┐                       │
-                       │   [비용] Cognito JWT       [리소스] 계정 로컬          │
-                       │        → MCP 게이트웨이         boto3 (EC2/Lambda/S3   │
-                       │        → get_cost_summary       · 실제 Read-Only)      │
-                       │  → answer 반환 → 서울이 Slack response_url로 게시       │
-                       └───────────────────────────────────────────────────────┘
+                     ┌──────────────── 서울 (ap-northeast-2) ─────────────────┐
+[고객 A Slack]  ────►│  API Gateway ──► Lambda (SharkBot · Bolt, HTTP+OAuth)   │
+[고객 B Slack]  ────►│                    ├─ DynamoDB                          │
+[고객 C Slack]  ────►│                    │    · 고객사별 설치 토큰(멀티테넌트)  │
+   /zendesk          │                    │    · 티켓 ↔ 슬랙(채널·스레드)        │
+   /zendesk-status   │                    │    · 회사 → 슬랙 / 이메일 → 사용자   │
+   답장 버튼         │                    ├─ Zendesk API (티켓·커스텀 필드)     │
+   /ask              │                    └─ self-invoke 워커(비동기)           │
+        ▲            │                         ├─ /zendesk: 티켓 생성·채널 게시  │
+        │            │                         └─ /ask: team_id로 테넌트 라우팅┐│
+        │            └──────────────────────────────────────────────────────┼─┘
+        │ ① 담당자 답변/티켓→트리거→웹훅→슬랙 스레드 회신 (Zendesk)             │
+        │                          ② ASK_TENANT_MAP[team_id] → 그 고객 에이전트 URL
+    [Zendesk]                         (T0BL…A→tenant-a · …B→tenant-b · …C→…)  │
+                                                                              ▼
+                     ┌──────────────── 버지니아 (us-east-1) ──────────────────┐
+                     │  tenant-a API GW ─► 에이전트 A (Strands+Bedrock, CID 5cff)
+                     │  tenant-b API GW ─► 에이전트 B (              CID 3ae0)  │
+                     │  tenant-c API GW ─► 에이전트 C (              CID 2q80)  │
+                     │        │  질문 성격에 따라 도구 자동 선택                 │
+                     │        ├ [비용]  Cognito JWT(CID) → 중앙 MCP 게이트웨이   │
+                     │        │         → get_cost_summary                     │
+                     │        │            → sharkton-tenant-map (CID→테넌트)   │
+                     │        │            → sharkton-costs (테넌트별 비용)      │
+                     │        ├ [가이드] 중앙 MCP → search_internal_guide       │
+                     │        │         (Confluence · 공용 지식, 격리 불필요)    │
+                     │        └ [리소스] 계정 로컬 boto3 (EC2/Lambda/S3 · RO)    │
+                     │  → answer → 서울이 Slack response_url로 게시             │
+                     └─────────────────────────────────────────────────────────┘
+   (데모는 세 에이전트가 한 계정에 있고 API GW만 tenant별로 분리 = 실서비스 "계정별 배포"에 근접)
 ```
-> `/zendesk`는 서울에서 자기완결, `/ask`는 서울이 진입만 하고 **버지니아 에이전트**로 넘긴다(AgentCore가 버지니아만 지원 → SCP 우회). 둘을 잇는 건 환경변수 **`ASK_AGENT_URL`** 하나.
+> `/zendesk`는 서울에서 자기완결. `/ask`는 서울이 **team_id로 고객사를 판별(`ASK_TENANT_MAP`)** 해 그 고객 전용 **버지니아 에이전트**로 넘긴다(AgentCore가 버지니아만 지원 → SCP 우회).
+> **테넌트 격리 사슬**: `team_id`(어느 Slack) → 고객 에이전트 URL → 에이전트의 `CLIENT_ID`(JWT) → `sharkton-tenant-map`(CID→projectcode) → `sharkton-costs`(테넌트별 비용). A/B/C가 끝까지 안 섞인다.
 
 - **설치**: 고객이 `/slack/install`로 OAuth 승인 → 워크스페이스별 봇 토큰을 **DynamoDB**에 저장
 - **멀티테넌트**: 요청의 team_id로 해당 고객사 토큰을 조회해 응답 → 여러 고객사에 동시 배포
@@ -51,7 +58,7 @@
 | **파일 첨부(전 형식)** | 모달 `file_input`(png/jpg/pdf·**md/xlsx/csv/docx/zip 등 전 형식**) → Zendesk 티켓 + **채널 스레드에도 표시** | ✅ 배포 |
 | **양방향 동기화(담당자→고객)** | 담당자가 Zendesk에서 공개 답변/티켓 생성 → 그 **고객사 지원 채널 스레드**로 자동 회신 (텍스트 + **첨부 사진**) | ⚙️ 코드 완료 / 재설치·웹훅 설정 후 실동작 |
 | **상담사-먼저 티켓 라우팅** | 상담사가 직접 만든 티켓을 **회사 커스텀 필드**로 그 고객사 채널에 라우팅 | ⚙️ 코드 완료 / 위와 동일 |
-| **`/ask`** | 질문을 **버지니아(us-east-1) AgentCore 에이전트**로 넘겨 비용(MCP 게이트웨이)·리소스(로컬 boto3)를 조회해 한국어 답변. 서울은 진입·게시만 | ✅ 데모 실동작 |
+| **`/ask` (멀티테넌트)** | 질문을 **그 고객사 전용 버지니아 에이전트**로 라우팅(team_id 기준)해 비용(MCP 게이트웨이, **테넌트별 격리**)·리소스(로컬 boto3)·가이드(Confluence)를 조회해 한국어 답변. 서울은 판별·진입·게시만 | ✅ 데모 실동작 |
 
 ### `/zendesk` 문의 폼 필드
 양식 · 기술 분야(AWS/Datadog/NHN) · **회사(드롭다운)** · **요청자(회사 선택 시 직원 드롭다운)** · 참조(CC) · 제목 · AWS 계정 ID · AWS 서포트 플랜 · 긴급도 · 문의 내용 · 사진/파일 첨부
@@ -81,13 +88,29 @@
 - **활성화 조건**: ① Zendesk 웹훅·트리거(관리자 권한) + ② `files:write` 추가 후 **재설치** + ③ 워커 self-invoke용 `lambda:InvokeFunction`
 - **채널 참여**: 봇을 슬랙 채널에 **수동 `/invite @SharkBot`**(파일 업로드는 봇이 채널 멤버여야 가능). `ensureBotInChannel`의 `conversations.join`은 `channels:join` 스코프가 없어 `missing_scope`로 실패하지만, 이를 `already_in_channel`과 함께 **무해(benign)로 간주해 에러 로그를 남기지 않는다** — 초대만 돼 있으면 정상 동작하고, 봇이 진짜 채널에 없을 때만 `uploadV2`가 `not_in_channel`로 실제 실패를 알린다
 
-### `/ask` — 서울 → 버지니아 에이전트 (크로스 리전)
-AgentCore가 **버지니아(us-east-1)에서만 지원**되어, `/ask`의 두뇌는 버지니아에 두고 서울은 진입·게시만 담당한다 (전체 흐름은 위 아키텍처 참고).
-- **연결**: 서울 `/ask` 즉시 ack → 워커가 환경변수 **`ASK_AGENT_URL`**(버지니아 API GW)로 `{question}` HTTPS POST → 답변을 Slack `response_url`로 게시(`<thinking>` 제거). 코드: `app.js`의 `callAskAgent`/`handleAskWorker`
-- **도구**: 비용 = MCP 게이트웨이 경유 `get_cost_summary`(시연값) · 리소스 = 계정 로컬 boto3(실제 Read-Only)
-- **SCP 우회**: Bedrock이 버지니아 계정에서 실행되어 서울에서 막혔던 조직 SCP를 우회
+### `/ask` — 멀티테넌트 라우팅 (서울 판별 → 고객사별 버지니아 에이전트)
+AgentCore가 **버지니아(us-east-1)에서만 지원**되어, `/ask`의 두뇌는 버지니아에 두고 서울은 **어느 고객사인지 판별해 그 고객 에이전트로 넘기기만** 한다 (전체 흐름은 위 아키텍처 참고).
+
+**테넌트 라우팅 (team_id → 고객 에이전트)**
+- 서울 `/ask` 즉시 ack → 워커가 **`command.team_id`** 로 그 고객사를 판별. 코드: `resolveAgentUrl(teamId)` → `callAskAgent(question, teamId)` (`app.js`)
+- 매핑은 env **`ASK_TENANT_MAP`**(JSON): `{"<team_id>":"<에이전트 URL 또는 projectcode>", ...}`
+  - 값이 **전체 URL**이면 그대로 호출 (**B2** — 고객/테넌트마다 API Gateway가 따로)
+  - 값이 **projectcode**면 `ASK_AGENT_BASE_URL`과 조합해 `…/tenant-x` (**B1** — 공용 API 1개 + 경로만 다름)
+  - 매핑이 없으면 단일 **`ASK_AGENT_URL`** 폴백 → 그것도 없으면 로컬 Bedrock 폴백
+- ⚠️ **`ASK_TENANT_MAP` 값 칸엔 JSON만** 넣는다(`{`로 시작). `키:`/`값:` 라벨이나 줄바꿈이 섞이면 파싱 실패 → 폴백으로 새어 엉뚱한 에이전트로 감(로그에 `ASK_TENANT_MAP 파싱 실패`)
+- 답변은 Slack `response_url`로 게시(모델 `<thinking>` 제거)
+
+**테넌트 격리 (비용이 고객별로 갈리는 원리)**
+- 각 고객 에이전트 Lambda는 **자기 `CLIENT_ID`** 로 Cognito JWT 발급 → 중앙 MCP 게이트웨이의 `get_cost_summary` 호출
+- 비용툴이 JWT의 client_id → **`sharkton-tenant-map`**(client_id→projectcode) → **`sharkton-costs`**(projectcode별 비용) 순으로 조회 → **테넌트별 비용** 반환
+- **리소스**(`describe_resources`)는 그 계정 로컬 boto3(실제 Read-Only), **가이드**(`search_internal_guide`)는 Confluence 공용 지식(격리 불필요)
+
+**운영 메모**
+- **SCP 우회**: Bedrock이 버지니아 계정에서 실행되어 서울에서 막혔던 조직 SCP(`bedrock:*` 거부)를 우회
 - **주의**: 에이전트 응답이 수 초라 **서울 Lambda 타임아웃 60초** 필요
-- **역할 경계**: MCP 게이트웨이·툴 = 별도 담당(MCP), 서울 `/ask` 진입·연결 = SharkBot(본 저장소)
+- **테스트 팁**: "이번 달"은 월말 마감 전이면 "데이터 없음"이 정상 응답 → 데모는 **`/ask 지난달 비용`** 으로
+- **역할 경계**: MCP 게이트웨이·비용/가이드 툴·`sharkton-*` 테이블 = 별도 담당(MCP), 서울 `/ask` 진입·라우팅 = SharkBot(본 저장소)
+- **확장(향후)**: 현재는 `ASK_TENANT_MAP` 수동 관리(고객 3곳). 고객 증가 시 → **DynamoDB 라우팅 테이블** + 설치 링크 라벨로 team_id↔테넌트 자동 등록 + 인프라는 **StackSets/Terraform**으로 전환
 
 ## 구성 요소
 
@@ -100,7 +123,15 @@ AgentCore가 **버지니아(us-east-1)에서만 지원**되어, `/ask`의 두뇌
 | Lambda `sharkbot` | 실행 런타임 (Node.js 22.x, `app.handler`) + 비동기 self-invoke 워커 |
 | DynamoDB `sharkbot-installations` | 설치 토큰 + 라우팅 매핑(티켓·회사·이메일) — 한 테이블 `id` 프리픽스로 구분 |
 
-**기술 스택**: Node.js · Slack Bolt(HTTP + OAuth) · AWS Lambda / API Gateway / DynamoDB · Zendesk API · `/ask`는 **버지니아 AgentCore 에이전트**(Bedrock·Strands·MCP) 연동
+**기술 스택**: Node.js · Slack Bolt(HTTP + OAuth) · AWS Lambda / API Gateway / DynamoDB · Zendesk API · `/ask`는 **고객사별 버지니아 AgentCore 에이전트**(Bedrock·Strands·MCP)로 멀티테넌트 라우팅
+
+### 주요 환경 변수 (`/ask` 관련)
+| 변수 | 용도 |
+|---|---|
+| `ASK_TENANT_MAP` | **(핵심)** team_id → 고객 에이전트 URL(또는 projectcode) JSON 매핑. 값 칸엔 **JSON만** |
+| `ASK_AGENT_BASE_URL` | B1(공용 API+경로) 방식일 때 projectcode와 조합할 베이스 URL. B2(전체 URL)면 불필요 |
+| `ASK_AGENT_URL` | 매핑 없을 때 단일 폴백 에이전트 URL |
+| `BEDROCK_MODEL_ID` | 로컬 Bedrock 폴백용(서울 SCP로 현재 비활성) |
 
 ## OAuth 스코프
 

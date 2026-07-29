@@ -368,7 +368,7 @@ app.command('/ask', async ({ ack, command, respond, logger }) => {
           FunctionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
           InvocationType: 'Event', // 비동기
           Payload: Buffer.from(
-            JSON.stringify({ __askWorker: true, text: question, response_url: command.response_url })
+            JSON.stringify({ __askWorker: true, text: question, response_url: command.response_url, teamId: command.team_id, enterpriseId: command.enterprise_id })
           ),
         })
       );
@@ -1060,12 +1060,36 @@ async function handleReplyWorker(event) {
   return { ok: true };
 }
 
+// ── 헬퍼: Slack team_id → 고객사 에이전트 URL (테넌트 라우팅) ──
+// ASK_TENANT_MAP(env JSON, 고객 3곳이라 수동 관리)이 team_id를 다음 둘 중 하나로 매핑:
+//   1) 전체 URL 문자열  → 그대로 사용    (B2: 고객 계정마다 API Gateway가 따로)
+//        예: {"T_AAAA":"https://aaa.execute-api.us-east-1.amazonaws.com/"}
+//   2) projectcode 문자열 → ASK_AGENT_BASE_URL 과 조합  (B1: 공용 API 1개 + 경로만 다름)
+//        예: {"T_AAAA":"tenant-a"}  +  ASK_AGENT_BASE_URL=https://pokqlxp0h4…  → …/tenant-a
+// 매핑이 없으면 null → 단일 ASK_AGENT_URL 폴백.
+function resolveAgentUrl(teamId) {
+  if (!teamId) return null;
+  let entry;
+  try {
+    const map = JSON.parse(process.env.ASK_TENANT_MAP || '{}');
+    entry = map[teamId];
+  } catch (e) {
+    console.error('ASK_TENANT_MAP 파싱 실패:', e?.message || e);
+    return null;
+  }
+  if (!entry) return null;
+  if (/^https?:\/\//i.test(entry)) return entry; // 값이 전체 URL이면 그대로 (B2)
+  const base = (process.env.ASK_AGENT_BASE_URL || '').replace(/\/$/, ''); // projectcode면 BASE와 조합 (B1)
+  return base ? `${base}/${entry}` : null;
+}
+
 // ── 헬퍼: 버지니아(us-east-1) 에이전트 API 호출 ──────────────
 // AgentCore는 버지니아에서만 지원되므로 /ask 두뇌는 버지니아 에이전트 Lambda가 담당.
-// 서울은 진입·게시만 하고, 실제 Bedrock+MCP 처리는 이 API가 수행한다.
-// ASK_AGENT_URL 미설정 시 로컬 Bedrock(askBedrock)로 폴백.
-async function callAskAgent(question) {
-  const url = process.env.ASK_AGENT_URL;
+// 서울은 진입·게시만 하고, 실제 Bedrock+MCP 처리는 그 고객사 에이전트가 수행한다.
+//   - team_id로 고객사 에이전트 URL 해석(B1/B2 모두 지원) → 그 URL로 호출
+//   - 매핑 없으면 단일 ASK_AGENT_URL 폴백, 그것도 없으면 로컬 Bedrock(askBedrock) 폴백
+async function callAskAgent(question, teamId) {
+  const url = resolveAgentUrl(teamId) || process.env.ASK_AGENT_URL;
   if (!url) return askBedrock(question); // 폴백(로컬)
   const res = await fetch(url, {
     method: 'POST',
@@ -1082,7 +1106,7 @@ async function callAskAgent(question) {
 // ── 헬퍼: 비동기 워커 (에이전트 처리 후 response_url로 게시) ──
 async function handleAskWorker(event) {
   try {
-    const answer = await callAskAgent(event.text);
+    const answer = await callAskAgent(event.text, event.teamId);
     await postToResponseUrl(event.response_url, answer);
   } catch (e) {
     await postToResponseUrl(event.response_url, `⚠️ 답변 생성 중 오류가 발생했습니다: ${e.message}`);
